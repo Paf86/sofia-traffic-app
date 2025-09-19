@@ -1,3 +1,6 @@
+import zipfile
+import os
+
 import requests
 from flask import Flask, jsonify
 from google.transit import gtfs_realtime_pb2
@@ -212,5 +215,6 @@ def get_shape_for_trip(trip_id):
     shape_points = shapes_data.get(trip_info['shape_id'])
     if not shape_points: return jsonify({"error": "Геометрия не е намерена"}), 404
     return jsonify(shape_points)
+
 
 load_static_data()
