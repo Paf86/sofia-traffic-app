@@ -1,92 +1,108 @@
-import zipfile
-import os
-
 import requests
 from flask import Flask, jsonify
-from google.transit import gtfs_realtime_pb2
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta # <-- КОРИГИРАН IMPORT
 import pytz
 from flask_cors import CORS
-import time
+from bs4 import BeautifulSoup
 
-# Път до вашите GTFS файлове на PythonAnywhere
-BASE_PATH = ""
+# Път до вашите GTFS файлове - УВЕРЕТЕ СЕ, ЧЕ Е ВЕРЕН ЗА ВАШИЯ АКАУНТ!
+BASE_PATH = "/home/paf1986/"
 
 app = Flask(__name__)
 CORS(app)
 
-# Глобални структури за данни и кеш
-routes_data, trips_data, stops_data, arrivals_by_stop, active_services, shapes_data = {}, {}, {}, {}, set(), {}
-schedule_by_trip = {}
-realtime_data_cache = {}
-last_realtime_fetch = 0
+# Глобални структури за данни
+routes_data, trips_data, stops_data, arrivals_by_stop = {}, {}, {}, {}
+active_services, shapes_data, schedule_by_trip = set(), {}, {}
 
 def get_seconds_from_midnight(time_str):
+    """Превръща време 'HH:MM:SS' в секунди от полунощ."""
     try:
-        h, m, s = map(int, time_str.split(':'))
+        if 'мин' in time_str:
+            now = datetime.now(pytz.timezone('Europe/Sofia'))
+            minutes = int(time_str.split()[0])
+            arrival_time = now.hour * 3600 + now.minute * 60 + now.second + (minutes * 60)
+            return arrival_time
+        elif 'Пристига' in time_str:
+            return (datetime.now(pytz.timezone('Europe/Sofia')).hour * 3600 + 
+                    datetime.now(pytz.timezone('Europe/Sofia')).minute * 60 + 
+                    datetime.now(pytz.timezone('Europe/Sofia')).second)
+        parts = list(map(int, time_str.split(':')))
+        h, m, s = parts[0], parts[1], parts[2] if len(parts) > 2 else 0
         return h * 3600 + m * 60 + s
-    except (ValueError, AttributeError):
-        return 0
+    except (ValueError, AttributeError, IndexError):
+        return 99999
 
-def fetch_and_parse_realtime_data():
-    """
-    Изтегля, парсва и кешира данните в реално време, заобикаляйки ограниченията на PythonAnywhere.
-    """
-    global realtime_data_cache, last_realtime_fetch
+# --- ИЗЦЯЛО ПРЕНАПИСАНА ФУНКЦИЯ ЗА СКРЕЙПИНГ ---
+def fetch_from_sofia_traffic(stop_code):
+    """Извлича данни чрез симулиране на POST заявка към sofiatraffic.bg."""
+    if not stop_code:
+        return []
     
-    if time.time() - last_realtime_fetch < 20:
-        return realtime_data_cache
-
+    # Това е правилният URL, който сайтът използва вътрешно
+    url = "https://www.sofiatraffic.bg/bg/schedules/stops-info"
+    # Данните, които изпращаме, имитирайки търсенето на сайта
+    payload = {'stop_code_q': stop_code}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest' # Важен хедър, който показва, че заявката е динамична
+    }
+    
     try:
-        # Оригинален URL
-        target_url = "https://gtfs.sofiattraffic.bg/api/v1/trip-updates"
-        # Прокси URL, за да заобиколим ограничението "403 Forbidden"
-        proxy_url = f"https://corsproxy.io/?{requests.utils.quote(target_url)}"
-        
-        # Използваме proxy_url за заявката
-        response = requests.get(proxy_url, timeout=15) # Увеличаваме таймаута заради проксито
-        
-        if response.status_code == 200:
-            feed = gtfs_realtime_pb2.FeedMessage()
-            feed.ParseFromString(response.content)
-            
-            processed_updates = {}
-            for entity in feed.entity:
-                if entity.HasField('trip_update'):
-                    trip_id = entity.trip_update.trip.trip_id
-                    stop_updates = {}
-                    for update in entity.trip_update.stop_time_update:
-                        stop_sequence = update.stop_sequence
-                        delay = update.arrival.delay if update.arrival.HasField('delay') else 0
-                        arrival_time_unix = update.arrival.time if update.arrival.HasField('time') else 0
-                        stop_updates[stop_sequence] = {'delay': delay, 'time': arrival_time_unix}
-                    processed_updates[trip_id] = stop_updates
+        # Използваме POST заявка вместо GET
+        response = requests.post(url, data=payload, headers=headers, timeout=15)
+        if response.status_code != 200:
+            print(f"ГРЕШКА при достъп до schedules/stops-info. Статус: {response.status_code}")
+            return []
 
-            realtime_data_cache = processed_updates
-            last_realtime_fetch = time.time()
-            print(f"Успешно заредени {len(processed_updates)} актуализации в реално време (през прокси).")
-            return processed_updates
-        else:
-            print(f"ГРЕШКА при изтегляне през прокси. Статус код: {response.status_code}")
-            return {} # Връщаме празен речник при грешка
+        # Отговорът е HTML, който парсваме
+        soup = BeautifulSoup(response.text, 'html.parser')
+        arrivals = []
+        
+        arrival_rows = soup.find_all('div', class_='arrival-row')
+        
+        for row in arrival_rows:
+            line_element = row.find('span', class_='line_number')
+            time_element = row.find('div', class_='time').find('span')
+
+            if line_element and time_element:
+                line_name = line_element.text.strip()
+                arrival_time_text = time_element.text.strip()
+                
+                now = datetime.now(pytz.timezone('Europe/Sofia'))
+                timing_str = now.strftime('%H:%M:%S') # По подразбиране е сега
+                
+                if 'мин' in arrival_time_text:
+                    try:
+                        minutes_to_add = int(arrival_time_text.split()[0])
+                        arrival_dt = now + timedelta(minutes=minutes_to_add)
+                        timing_str = arrival_dt.strftime('%H:%M:%S')
+                    except (ValueError, IndexError):
+                        pass # Ако не успеем да парснем, остава сегашното време
+                
+                arrivals.append({
+                    "lineName": line_name,
+                    "timing": timing_str
+                })
+                
+        return arrivals
 
     except requests.RequestException as e:
-        print(f"КРИТИЧНА ГРЕШКА при изтегляне на данни в реално време: {e}")
-        return {} # Връщаме празен речник при грешка
+        print(f"КРИТИЧНА ГРЕШКА при връзка със sofiatraffic.bg (POST): {e}")
+        return []
+    except Exception as e:
+        print(f"ГРЕШКА при парсване на HTML от sofiatraffic.bg (POST): {e}")
+        return []
 
 def load_static_data():
+    """Зарежда всички статични GTFS данни от файлове при стартиране."""
     global routes_data, trips_data, stops_data, arrivals_by_stop, active_services, shapes_data, schedule_by_trip
-    # (Тази функция остава без промяна)
     try:
         with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f): routes_data[row['route_id']] = row
-        print(f"Заредени {len(routes_data)} маршрута.")
-
         with open(f'{BASE_PATH}trips.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f): trips_data[row['trip_id']] = row
-        print(f"Заредени {len(trips_data)} курса.")
-
         active_stop_ids = set()
         with open(f'{BASE_PATH}stop_times.txt', mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
@@ -96,125 +112,132 @@ def load_static_data():
                 if stop_id not in arrivals_by_stop: arrivals_by_stop[stop_id] = []
                 arrivals_by_stop[stop_id].append(row)
                 if trip_id not in schedule_by_trip: schedule_by_trip[trip_id] = []
-                schedule_by_trip[trip_id].append({
-                    "stop_id": stop_id,
-                    "arrival_time": row["arrival_time"],
-                    "stop_sequence": int(row["stop_sequence"])
-                })
-        print(f"Индексирането на разписанията приключи.")
-
+                schedule_by_trip[trip_id].append(row)
         temp_stops_data = {}
         with open(f'{BASE_PATH}stops.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
-                if row['stop_id'] in active_stop_ids:
-                    temp_stops_data[row['stop_id']] = row
+                if row['stop_id'] in active_stop_ids: temp_stops_data[row['stop_id']] = row
         stops_data = temp_stops_data
-        print(f"Заредени {len(stops_data)} АКТИВНИ спирки.")
-
         today_str = datetime.now(pytz.timezone('Europe/Sofia')).strftime('%Y%m%d')
         with open(f'{BASE_PATH}calendar_dates.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
-                if row['date'] == today_str and row['exception_type'] == '1':
-                    active_services.add(row['service_id'])
-        print(f"Намерени {len(active_services)} активни услуги за днес.")
-
+                if row['date'] == today_str and row['exception_type'] == '1': active_services.add(row['service_id'])
         for trip_id in schedule_by_trip:
-            schedule_by_trip[trip_id].sort(key=lambda x: x['stop_sequence'])
-
+            schedule_by_trip[trip_id].sort(key=lambda x: int(x['stop_sequence']))
         with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
                 shape_id = row['shape_id']
                 if shape_id not in shapes_data: shapes_data[shape_id] = []
                 shapes_data[shape_id].append((float(row['shape_pt_lat']), float(row['shape_pt_lon'])))
-        print(f"Заредени {len(shapes_data)} геометрии.")
-    except FileNotFoundError as e:
-        print(f"КРИТИЧНА ГРЕШКА: Файлът {e.filename} не е намерен.")
-        return False
-    return True
-
-@app.route('/api/stops_for_trip/<trip_id>')
-def get_stops_for_trip(trip_id):
-    # (Тази функция остава без промяна)
-    full_schedule = schedule_by_trip.get(trip_id)
-    if not full_schedule: return jsonify({"error": "Графикът за този курс не е намерен"}), 404
-    stops_with_details = []
-    for stop_time in full_schedule:
-        stop_id, stop_details = stop_time['stop_id'], stops_data.get(stop_id)
-        if stop_details:
-            stops_with_details.append({ "stop_id": stop_id, "stop_name": stop_details.get("stop_name"), "stop_lat": stop_details.get("stop_lat"), "stop_lon": stop_details.get("stop_lon"), "stop_sequence": stop_time["stop_sequence"] })
-    return jsonify(stops_with_details)
-
-@app.route('/api/all_stops')
-def get_all_stops():
-    # (Тази функция остава без промяна)
-    return jsonify([sdata for sdata in stops_data.values() if sdata.get('location_type', '0') in ['0', '1', '']])
+        print("Всички статични данни са заредени успешно.")
+    except Exception as e:
+        print(f"КРИТИЧНА ГРЕШКА при зареждане на статични данни: {e}")
 
 @app.route('/api/arrivals/<stop_id>')
 def get_live_arrivals(stop_id):
-    # (Тази функция е с добавена дебъг информация)
-    try:
-        live_updates = fetch_and_parse_realtime_data()
-        debug_info = { "total_realtime_updates_fetched": len(live_updates) }
+    stop_info = stops_data.get(stop_id)
+    stop_code = stop_info.get('stop_code') if stop_info else None
+    
+    api_arrivals = fetch_from_sofia_traffic(stop_code)
 
-        sofia_tz = pytz.timezone('Europe/Sofia')
-        now = datetime.now(sofia_tz)
-        seconds_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+    if not api_arrivals:
+        return jsonify({"arrivals": []})
+
+    all_arrivals = []
+    
+    for arrival in api_arrivals:
+        line_name = arrival.get("lineName")
+        arrival_time_str = arrival.get("timing")
         
-        stop_info = stops_data.get(stop_id)
-        if not stop_info: return jsonify({"arrivals": [], "debug_info": debug_info})
+        if not line_name or not arrival_time_str:
+            continue
 
-        stop_code = stop_info.get('stop_code')
-        search_ids = set([stop_id])
-        if stop_code:
-            for s_id, s_data in stops_data.items():
-                if s_data.get('stop_code') == stop_code: search_ids.add(s_id)
+        found_trip_info = None
+        stop_ids_for_code = [s_id for s_id, s_data in stops_data.items() if s_data.get('stop_code') == stop_code]
+
+        for s_id in stop_ids_for_code:
+            if s_id in arrivals_by_stop:
+                for scheduled in arrivals_by_stop[s_id]:
+                    trip = trips_data.get(scheduled['trip_id'])
+                    route = routes_data.get(trip.get('route_id')) if trip else None
+                    if route and route.get('route_short_name') == line_name and trip.get('service_id') in active_services:
+                        found_trip_info = {
+                            "trip_id": scheduled['trip_id'],
+                            "route_short_name": line_name,
+                            "destination": trip.get('trip_headsign', 'Н/И'),
+                            "arrival_time": arrival_time_str.split(',')[0],
+                            "is_realtime": True,
+                            "route_type": route.get('route_type', '3'),
+                            "route_id": route.get('route_id'),
+                            "direction_id": trip.get('direction_id', 'N/A')
+                        }
+                        break
+            if found_trip_info:
+                break
         
-        all_arrivals = []
-        for search_id in search_ids:
-            if search_id in arrivals_by_stop:
-                for arrival_info in arrivals_by_stop[search_id]:
-                    trip_id, trip_info = arrival_info['trip_id'], trips_data.get(arrival_info['trip_id'])
-                    if not (trip_info and trip_info.get('service_id') in active_services): continue
+        if found_trip_info:
+            all_arrivals.append(found_trip_info)
 
-                    route_info = routes_data.get(trip_info.get('route_id'), {})
-                    is_realtime, delay_seconds, final_arrival_time_str = False, 0, arrival_info['arrival_time']
-                    
-                    if trip_id in live_updates:
-                        current_stop_sequence = int(arrival_info['stop_sequence'])
-                        if current_stop_sequence in live_updates[trip_id]:
-                            update = live_updates[trip_id][current_stop_sequence]
-                            is_realtime, delay_seconds = True, update['delay']
-                            if update['time'] > 0:
-                                final_arrival_time_str = datetime.fromtimestamp(update['time'], sofia_tz).strftime('%H:%M:%S')
-                            else:
-                                h, rem = divmod(get_seconds_from_midnight(arrival_info['arrival_time']) + delay_seconds, 3600)
-                                m, s = divmod(rem, 60)
-                                final_arrival_time_str = f"{int(h):02}:{int(m):02}:{int(s):02}"
+    now = datetime.now(pytz.timezone('Europe/Sofia'))
+    seconds_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+    upcoming = [a for a in all_arrivals if get_seconds_from_midnight(a['arrival_time']) >= seconds_since_midnight]
+    
+    unique_arrivals = list({f"{v['route_short_name']}_{v['arrival_time']}": v for v in upcoming}.values())
+    unique_arrivals.sort(key=lambda x: get_seconds_from_midnight(x['arrival_time']))
+    
+    return jsonify({"arrivals": unique_arrivals})
 
-                    all_arrivals.append({ "trip_id": trip_id, "route_short_name": route_info.get('route_short_name', 'N/A'), "destination": trip_info.get('trip_headsign', 'Н/И'), "scheduled_time": arrival_info['arrival_time'], "arrival_time": final_arrival_time_str, "route_type": route_info.get('route_type', '3'), "route_id": trip_info.get('route_id'), "direction_id": trip_info.get('direction_id', 'N/A'), "is_realtime": is_realtime, "delay": delay_seconds })
+@app.route('/api/stops_for_trip/<trip_id>')
+def get_stops_for_trip(trip_id):
+    full_schedule = schedule_by_trip.get(trip_id, [])
+    stops_with_details = [
+        {
+            "stop_id": st.get('stop_id'),
+            "stop_name": stops_data.get(st.get('stop_id'), {}).get("stop_name"),
+            "stop_lat": stops_data.get(st.get('stop_id'), {}).get("stop_lat"),
+            "stop_lon": stops_data.get(st.get('stop_id'), {}).get("stop_lon"),
+        }
+        for st in full_schedule if st.get('stop_id') in stops_data
+    ]
+    return jsonify(stops_with_details)
 
-        upcoming = [a for a in all_arrivals if get_seconds_from_midnight(a['arrival_time']) > seconds_since_midnight]
-        
-        if upcoming:
-            upcoming.sort(key=lambda x: get_seconds_from_midnight(x['arrival_time']))
-            return jsonify({ "arrivals": upcoming[:30], "debug_info": debug_info })
+@app.route('/api/routes_for_stop/<stop_id>')
+def get_routes_for_stop(stop_id):
+    if stop_id not in arrivals_by_stop:
+        return jsonify([])
+
+    trip_ids = {arrival['trip_id'] for arrival in arrivals_by_stop[stop_id]}
+    
+    route_ids = set()
+    for trip_id in trip_ids:
+        trip_info = trips_data.get(trip_id)
+        if trip_info and trip_info.get('service_id') in active_services:
+            route_ids.add(trip_info['route_id'])
             
-        all_day_lines = {a['route_short_name']: {**a, "arrival_time": "Извън работно време", "is_schedule": True} for a in all_arrivals if a['route_short_name'] not in {}}
-        sorted_lines = sorted(all_day_lines.values(), key=lambda x: int(x['route_short_name']) if x['route_short_name'].isdigit() else 999)
-        return jsonify({ "arrivals": sorted_lines, "debug_info": debug_info })
+    routes_for_this_stop = []
+    for route_id in route_ids:
+        route_info = routes_data.get(route_id)
+        if route_info:
+            routes_for_this_stop.append({
+                "route_id": route_info.get('route_id'),
+                "route_short_name": route_info.get('route_short_name')
+            })
 
-    except Exception as e:
-        print(f"Error in get_live_arrivals: {e}")
-        return jsonify({ "error": str(e), "arrivals": [], "debug_info": {"total_realtime_updates_fetched": -1} }), 500
+    return jsonify(routes_for_this_stop)
+
+@app.route('/api/all_stops')
+def get_all_stops():
+    return jsonify(list(stops_data.values()))
 
 @app.route('/api/shape/<trip_id>')
 def get_shape_for_trip(trip_id):
-    # (Тази функция остава без промяна)
     trip_info = trips_data.get(trip_id)
-    if not trip_info or 'shape_id' not in trip_info: return jsonify({"error": "Маршрут не е намерен"}), 404
+    if not trip_info or 'shape_id' not in trip_info:
+        return jsonify({"error": "Маршрут не е намерен"}), 404
     shape_points = shapes_data.get(trip_info['shape_id'])
-    if not shape_points: return jsonify({"error": "Геометрия не е намерена"}), 404
+    if not shape_points:
+        return jsonify({"error": "Геометрия не е намерена"}), 404
     return jsonify(shape_points)
 
-
+# Зареждаме статичните данни при стартиране на сървъра
 load_static_data()
