@@ -1,28 +1,23 @@
 # ===================================================================
 # ==            ФИНАЛЕН ДЕБЪГ КОД ЗА СЪРВЪРА В RENDER.COM        ==
-# ==         (Добавен е тест endpoint, за да сме сигурни)       ==
+# ==         (Записва получения HTML в лога за анализ)          ==
 # ===================================================================
-
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
 
-# +++ ТЕСТОВ ENDPOINT +++
-# Този ред е добавен, за да можем да проверим дали сървърът е жив.
 @app.route('/')
 def health_check():
     return jsonify({"status": "ok", "message": "Скрейпър сървърът в Render работи!"})
-# ++++++++++++++++++++++++
 
-
-def fetch_from_sofia_traffic(stop_code):
-    """Извлича данни за пристигания от sofiatraffic.bg."""
+@app.route('/api/arrivals/<stop_code>')
+def get_live_arrivals(stop_code):
+    print(f"--- ЗАПОЧВА НОВА ЗАЯВКА ЗА СПИРКА {stop_code} ---")
     if not stop_code:
-        return []
+        return jsonify({"arrivals":[]})
         
     url = "https://www.sofiatraffic.bg/bg/schedules/stops-info"
     payload = {'stop_code_q': stop_code}
@@ -33,27 +28,18 @@ def fetch_from_sofia_traffic(stop_code):
     
     try:
         response = requests.post(url, data=payload, headers=headers, timeout=15)
-        if response.status_code != 200:
-            return []
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        arrivals = []
-        arrival_rows = soup.find_all('div', class_='arrival-row')
+        print(f"Статус код от sofiatraffic.bg: {response.status_code}")
         
-        for row in arrival_rows:
-            line_element = row.find('span', class_='line_number')
-            time_element = row.find('div', class_='time').find('span')
-            if line_element and time_element:
-                arrivals.append({
-                    "line": line_element.text.strip(),
-                    "time": time_element.text.strip()
-                })
-        return arrivals
-    except:
-        return []
+        # --- ТОВА Е КЛЮЧОВИЯТ РЕД ---
+        # Записваме целия получен HTML в лога
+        print("--- НАЧАЛО НА ПОЛУЧЕНИЯ HTML ---")
+        print(response.text)
+        print("--- КРАЙ НА ПОЛУЧЕНИЯ HTML ---")
+        # -----------------------------
 
-@app.route('/api/arrivals/<stop_code>')
-def get_live_arrivals(stop_code):
-    """Единственият endpoint: взима код на спирка и връща пристигания."""
-    live_arrivals = fetch_from_sofia_traffic(stop_code)
-    return jsonify({"arrivals": live_arrivals})
+        # Засега просто връщаме празен резултат, целта е само да видим лога
+        return jsonify({"arrivals":[]})
+
+    except Exception as e:
+        print(f"ГРЕШКА ПРИ ЗАЯВКАТА: {e}")
+        return jsonify({"error": str(e)}), 500
