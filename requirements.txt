@@ -1,7 +1,10 @@
-Flask
-requests
-gunicorn
-pytz
 Flask-Cors
 protobuf
 gtfs-realtime-bindings
+Flask
+requests
+pytz
+flask-cors
+beautifulsoup4
+gunicorn
+
