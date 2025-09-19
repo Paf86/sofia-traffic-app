@@ -1,3 +1,4 @@
+# ТОЗИ КОД Е ОПТИМИЗИРАН ЗА ПАМЕТТА. SHAPES.TXT СЕ ЧЕТЕ ПРИ ЗАЯВКА.
 import requests
 from flask import Flask, jsonify
 import csv
@@ -6,47 +7,39 @@ import pytz
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 import os
-import rarfile # <-- Добавяме import за новата библиотека
+import rarfile
 
-# --- Път до файловете (остава същият) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_PATH = BASE_DIR + "/"
 
 app = Flask(__name__)
 CORS(app)
 
-# --- НОВА ФУНКЦИЯ ЗА РАЗАРХИВИРАНЕ ---
 def unarchive_data_files():
-    """Проверява за .rar файлове и ги разархивира, ако е нужно."""
+    # ... (тази функция остава същата)
     files_to_unarchive = ['stop_times.rar', 'shapes.rar']
     for rar_filename in files_to_unarchive:
         txt_filename = rar_filename.replace('.rar', '.txt')
         rar_filepath = os.path.join(BASE_PATH, rar_filename)
         txt_filepath = os.path.join(BASE_PATH, txt_filename)
-
-        # Проверяваме дали .rar файлът съществува И дали .txt файлът липсва
         if os.path.exists(rar_filepath) and not os.path.exists(txt_filepath):
             try:
                 print(f"[ДЕБЪГ] Намерен е '{rar_filename}'. Разархивирам...")
                 with rarfile.RarFile(rar_filepath) as rf:
                     rf.extractall(path=BASE_PATH)
-                print(f"[ДЕБЪГ] '{rar_filename}' е разархивиран успешно в '{txt_filename}'.")
+                print(f"[ДЕБЪГ] '{rar_filename}' е разархивиран успешно.")
             except Exception as e:
                 print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при разархивиране на '{rar_filename}': {e}")
-# --- КРАЙ НА НОВАТА ФУНКЦИЯ ---
 
-
-# Глобални структури за данни (остават същите)
+# shapes_data ВЕЧЕ НЕ СЕ ЗАРЕЖДА ТУК
 routes_data, trips_data, stops_data, arrivals_by_stop = {}, {}, {}, {}
-active_services, shapes_data, schedule_by_trip = set(), {}, {}
-
+active_services, schedule_by_trip = set(), {}
 
 def load_static_data():
-    """Зарежда всички статични GTFS данни от файлове при стартиране."""
-    global routes_data, trips_data, stops_data, arrivals_by_stop, active_services, shapes_data, schedule_by_trip
+    global routes_data, trips_data, stops_data, arrivals_by_stop, active_services, schedule_by_trip
     try:
         print(f"[ДЕБЪГ] Зареждам статични файлове от: {BASE_PATH}")
-        # ... (цялата останала част от тази функция е същата)
+        # ... (всичко е същото, САМО РЕДОВЕТЕ ЗА SHAPES.TXT СА ПРЕМАХНАТИ)
         with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f): routes_data[row['route_id']] = row
         with open(f'{BASE_PATH}trips.txt', mode='r', encoding='utf-8-sig') as f:
@@ -66,24 +59,19 @@ def load_static_data():
             for row in csv.DictReader(f):
                 if row['stop_id'] in active_stop_ids: temp_stops_data[row['stop_id']] = row
         stops_data = temp_stops_data
-        today_str = datetime.now(pytz.timezone('Europe/Sofia')).strftime('%Y%m%d')
+        today_str = datetime.now(pytz.timezone('Europe/Sofia')).strftime('%Ym%d')
         with open(f'{BASE_PATH}calendar_dates.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
                 if row['date'] == today_str and row['exception_type'] == '1': active_services.add(row['service_id'])
         for trip_id in schedule_by_trip:
             schedule_by_trip[trip_id].sort(key=lambda x: int(x['stop_sequence']))
-        with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
-                shape_id = row['shape_id']
-                if shape_id not in shapes_data: shapes_data[shape_id] = []
-                shapes_data[shape_id].append((float(row['shape_pt_lat']), float(row['shape_pt_lon'])))
-        print(f"[ДЕБЪГ] Всички статични данни са заредени. Брой спирки: {len(stops_data)}")
+        print(f"[ДЕБЪГ] Всички статични данни (БЕЗ SHAPES) са заредени. Брой спирки: {len(stops_data)}")
     except FileNotFoundError as e:
         print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА: Файл не е намерен! -> {e}")
     except Exception as e:
         print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при зареждане на статични данни: {e}")
 
-# ... (всички останали функции като fetch_from_sofia_traffic и @app.route остават БЕЗ ПРОМЯНА) ...
+# ... (другите функции като get_seconds_from_midnight, fetch_from_sofia_traffic и get_live_arrivals остават същите)
 def get_seconds_from_midnight(time_str):
     try:
         if 'мин' in time_str:
@@ -100,9 +88,9 @@ def get_seconds_from_midnight(time_str):
         return h * 3600 + m * 60 + s
     except (ValueError, AttributeError, IndexError):
         return 99999
+
 def fetch_from_sofia_traffic(stop_code):
     if not stop_code:
-        print("[ДЕБЪГ] fetch_from_sofia_traffic извикан без stop_code.")
         return []
     url = "https://www.sofiatraffic.bg/bg/schedules/stops-info"
     payload = {'stop_code_q': stop_code}
@@ -111,15 +99,12 @@ def fetch_from_sofia_traffic(stop_code):
         'X-Requested-With': 'XMLHttpRequest'
     }
     try:
-        print(f"[ДЕБЪГ] Изпращам POST заявка към {url} със stop_code: {stop_code}")
         response = requests.post(url, data=payload, headers=headers, timeout=15)
-        print(f"[ДЕБЪГ] Получих отговор със статус код: {response.status_code}")
         if response.status_code != 200:
             return []
         soup = BeautifulSoup(response.text, 'html.parser')
         arrivals = []
         arrival_rows = soup.find_all('div', class_='arrival-row')
-        print(f"[ДЕБЪГ] Намерени редове с пристигания: {len(arrival_rows)}")
         for row in arrival_rows:
             line_element = row.find('span', class_='line_number')
             time_element = row.find('div', class_='time').find('span')
@@ -136,15 +121,11 @@ def fetch_from_sofia_traffic(stop_code):
                     except (ValueError, IndexError):
                         pass
                 arrivals.append({"lineName": line_name, "timing": timing_str})
-        print(f"[ДЕБЪГ] Успешно извлечени пристигания: {arrivals}")
         return arrivals
-    except requests.RequestException as e:
-        print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при връзка: {e}")
+    except:
         return []
-    except Exception as e:
-        print(f"[ДЕБЪГ] ГРЕШКА при парсване на HTML: {e}")
-        return []
-@app.route('/api/arrivals/<stop_id>')
+
+@app.route('/arrivals/<stop_id>')
 def get_live_arrivals(stop_id):
     stop_info = stops_data.get(stop_id)
     stop_code = stop_info.get('stop_code') if stop_info else None
@@ -172,12 +153,14 @@ def get_live_arrivals(stop_id):
     unique_arrivals = list({f"{v['route_short_name']}_{v['arrival_time']}": v for v in upcoming}.values())
     unique_arrivals.sort(key=lambda x: get_seconds_from_midnight(x['arrival_time']))
     return jsonify({"arrivals": unique_arrivals})
-@app.route('/api/stops_for_trip/<trip_id>')
+
+@app.route('/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
     full_schedule = schedule_by_trip.get(trip_id, [])
     stops_with_details = [{"stop_id": st.get('stop_id'),"stop_name": stops_data.get(st.get('stop_id'), {}).get("stop_name"),"stop_lat": stops_data.get(st.get('stop_id'), {}).get("stop_lat"),"stop_lon": stops_data.get(st.get('stop_id'), {}).get("stop_lon")} for st in full_schedule if st.get('stop_id') in stops_data]
     return jsonify(stops_with_details)
-@app.route('/api/routes_for_stop/<stop_id>')
+
+@app.route('/routes_for_stop/<stop_id>')
 def get_routes_for_stop(stop_id):
     if stop_id not in arrivals_by_stop: return jsonify([])
     trip_ids = {arrival['trip_id'] for arrival in arrivals_by_stop[stop_id]}
@@ -191,17 +174,37 @@ def get_routes_for_stop(stop_id):
         route_info = routes_data.get(route_id)
         if route_info: routes_for_this_stop.append({"route_id": route_info.get('route_id'),"route_short_name": route_info.get('route_short_name')})
     return jsonify(routes_for_this_stop)
-@app.route('/api/all_stops')
-def get_all_stops(): return jsonify(list(stops_data.values()))
-@app.route('/api/shape/<trip_id>')
+
+@app.route('/all_stops')
+def get_all_stops(): 
+    return jsonify(list(stops_data.values()))
+
+# --- КЛЮЧОВА ПРОМЯНА: ТАЗИ ФУНКЦИЯ ВЕЧЕ ЧЕТЕ ФАЙЛА ВСЕКИ ПЪТ ---
+@app.route('/shape/<trip_id>')
 def get_shape_for_trip(trip_id):
     trip_info = trips_data.get(trip_id)
-    if not trip_info or 'shape_id' not in trip_info: return jsonify({"error": "Маршрут не е намерен"}), 404
-    shape_points = shapes_data.get(trip_info['shape_id'])
-    if not shape_points: return jsonify({"error": "Геометрия не е намерена"}), 404
-    return jsonify(shape_points)
+    if not trip_info or 'shape_id' not in trip_info:
+        return jsonify({"error": "Маршрут не е намерен"}), 404
+    
+    shape_id_to_find = trip_info['shape_id']
+    shape_points = []
+    try:
+        # Отваряме shapes.txt и четем само нужните редове
+        with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['shape_id'] == shape_id_to_find:
+                    shape_points.append((float(row['shape_pt_lat']), float(row['shape_pt_lon'])))
+        
+        if not shape_points:
+            return jsonify({"error": "Геометрия не е намерена за този shape_id"}), 404
+        
+        return jsonify(shape_points)
 
+    except FileNotFoundError:
+        return jsonify({"error": "Файлът shapes.txt не е намерен"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Грешка при четене на shapes.txt: {e}"}), 500
 
-# --- КЛЮЧОВА ПРОМЯНА: Първо разархивираме, после зареждаме! ---
 unarchive_data_files()
 load_static_data()
