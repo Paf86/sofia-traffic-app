@@ -7,10 +7,4 @@ pytz
 flask-cors
 beautifulsoup4
 gunicorn
-Flask
-requests
-pytz
-flask-cors
-beautifulsoup4
-gunicorn
 rarfile
