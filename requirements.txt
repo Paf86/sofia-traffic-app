@@ -4,3 +4,4 @@ gunicorn
 pytz
 Flask-Cors
 protobuf
+gtfs-realtime-bindings
