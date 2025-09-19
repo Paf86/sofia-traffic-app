@@ -1,8 +1,8 @@
-# Използваме ПЪЛНАТА официална Python 3.11 версия
+# Използваме пълната официална Python 3.11 версия
 FROM python:3.11
 
-# Инсталираме системния пакет unrar
-RUN apt-get update && apt-get install -y unrar
+# Инсталираме системния пакет unrar-free, който е в стандартните хранилища
+RUN apt-get update && apt-get install -y unrar-free
 
 # Задаваме работната директория
 WORKDIR /app
