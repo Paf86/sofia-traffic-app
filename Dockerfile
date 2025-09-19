@@ -1,5 +1,5 @@
-# Използваме официалния Python имидж на Render
-FROM render/python:3
+# Използваме ОФИЦИАЛНИЯ Python имидж от Docker Hub
+FROM python:3.11-slim
 
 # Инсталираме системния пакет unrar
 RUN apt-get update && apt-get install -y unrar
@@ -16,5 +16,5 @@ RUN pip install -r requirements.txt
 # Копираме всички останали файлове от проекта
 COPY . .
 
-# Командата за стартиране на сървъра
+# Командата за стартиране на сървъра (остава същата)
 CMD ["gunicorn", "server:app"]
