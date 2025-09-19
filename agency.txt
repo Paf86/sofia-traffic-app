@@ -1,0 +1,2 @@
+agency_id,agency_name,agency_url,agency_timezone,agency_lang,agency_phone,agency_email
+A,Център за градска мобилност,https://www.sofiatraffic.bg/,Europe/Sofia,bg,070013233,office@sofiatraffic.bg
