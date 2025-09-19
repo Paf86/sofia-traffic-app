@@ -1,6 +1,6 @@
 # ===================================================================
-# ==                КОД ЗА СЪРВЪРА В RENDER.COM                  ==
-# ==    (Лек скрейпър за данни в реално време, без файлове)       ==
+# ==            ФИНАЛЕН ДЕБЪГ КОД ЗА СЪРВЪРА В RENDER.COM        ==
+# ==         (Добавен е тест endpoint, за да сме сигурни)       ==
 # ===================================================================
 
 from flask import Flask, jsonify
@@ -9,7 +9,15 @@ import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
-CORS(app) # Позволява достъп отвсякъде
+CORS(app)
+
+# +++ ТЕСТОВ ENDPOINT +++
+# Този ред е добавен, за да можем да проверим дали сървърът е жив.
+@app.route('/')
+def health_check():
+    return jsonify({"status": "ok", "message": "Скрейпър сървърът в Render работи!"})
+# ++++++++++++++++++++++++
+
 
 def fetch_from_sofia_traffic(stop_code):
     """Извлича данни за пристигания от sofiatraffic.bg."""
