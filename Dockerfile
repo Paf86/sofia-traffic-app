@@ -1,5 +1,5 @@
-# Използваме ОФИЦИАЛНИЯ Python имидж от Docker Hub
-FROM python:3.11-slim
+# Използваме ПЪЛНАТА официална Python 3.11 версия
+FROM python:3.11
 
 # Инсталираме системния пакет unrar
 RUN apt-get update && apt-get install -y unrar
@@ -16,5 +16,5 @@ RUN pip install -r requirements.txt
 # Копираме всички останали файлове от проекта
 COPY . .
 
-# Командата за стартиране на сървъра (остава същата)
+# Командата за стартиране на сървъра
 CMD ["gunicorn", "server:app"]
