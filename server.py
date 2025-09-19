@@ -5,17 +5,17 @@ from datetime import datetime, timedelta
 import pytz
 from flask_cors import CORS
 from bs4 import BeautifulSoup
-import os # <-- Добавяме нов import за работа с файловата система
+import os # <-- Уверете се, че този ред е тук
 
-# --- КЛЮЧОВА ПРОМЯНА: Правим пътя относителен, за да работи навсякъде ---
-# Взимаме директорията, в която се намира самият server.py файл
+# --- Това е най-важната част ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Пътят до файловете вече е относителен спрямо скрипта
 BASE_PATH = BASE_DIR + "/"
+# ------------------------------------
 
 app = Flask(__name__)
 CORS(app)
 
+# (останалата част от кода е същата като преди)
 # Глобални структури за данни
 routes_data, trips_data, stops_data, arrivals_by_stop = {}, {}, {}, {}
 active_services, shapes_data, schedule_by_trip = set(), {}, {}
@@ -61,7 +61,7 @@ def fetch_from_sofia_traffic(stop_code):
         arrivals = []
         
         arrival_rows = soup.find_all('div', class_='arrival-row')
-        print(f"[ДЕБЪГ] Намерени редове с пристигания: {len(arrival_rows)}") # Ключов дебъг ред
+        print(f"[ДЕБЪГ] Намерени редове с пристигания: {len(arrival_rows)}")
         
         for row in arrival_rows:
             line_element = row.find('span', class_='line_number')
@@ -98,13 +98,11 @@ def fetch_from_sofia_traffic(stop_code):
         return []
 
 def load_static_data():
-    """Зарежда всички статични GTFS данни от файлове при стартиране."""
     global routes_data, trips_data, stops_data, arrivals_by_stop, active_services, shapes_data, schedule_by_trip
     try:
         print(f"[ДЕБЪГ] Зареждам статични файлове от: {BASE_PATH}")
         with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f): routes_data[row['route_id']] = row
-        # ... (останалата част от функцията е същата)
         with open(f'{BASE_PATH}trips.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f): trips_data[row['trip_id']] = row
         active_stop_ids = set()
@@ -139,20 +137,16 @@ def load_static_data():
     except Exception as e:
         print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при зареждане на статични данни: {e}")
 
-# ... (всички @app.route функции остават същите) ...
 @app.route('/api/arrivals/<stop_id>')
 def get_live_arrivals(stop_id):
     stop_info = stops_data.get(stop_id)
     stop_code = stop_info.get('stop_code') if stop_info else None
     api_arrivals = fetch_from_sofia_traffic(stop_code)
-    if not api_arrivals:
-        return jsonify({"arrivals": []})
+    if not api_arrivals: return jsonify({"arrivals": []})
     all_arrivals = []
     for arrival in api_arrivals:
-        line_name = arrival.get("lineName")
-        arrival_time_str = arrival.get("timing")
-        if not line_name or not arrival_time_str:
-            continue
+        line_name, arrival_time_str = arrival.get("lineName"), arrival.get("timing")
+        if not line_name or not arrival_time_str: continue
         found_trip_info = None
         stop_ids_for_code = [s_id for s_id, s_data in stops_data.items() if s_data.get('stop_code') == stop_code]
         for s_id in stop_ids_for_code:
@@ -161,12 +155,10 @@ def get_live_arrivals(stop_id):
                     trip = trips_data.get(scheduled['trip_id'])
                     route = routes_data.get(trip.get('route_id')) if trip else None
                     if route and route.get('route_short_name') == line_name and trip.get('service_id') in active_services:
-                        found_trip_info = {"trip_id": scheduled['trip_id'], "route_short_name": line_name, "destination": trip.get('trip_headsign', 'Н/И'), "arrival_time": arrival_time_str.split(',')[0], "is_realtime": True, "route_type": route.get('route_type', '3'), "route_id": route.get('route_id'), "direction_id": trip.get('direction_id', 'N/A')}
+                        found_trip_info = {"trip_id": scheduled['trip_id'],"route_short_name": line_name,"destination": trip.get('trip_headsign', 'Н/И'),"arrival_time": arrival_time_str.split(',')[0],"is_realtime": True,"route_type": route.get('route_type', '3'),"route_id": route.get('route_id'),"direction_id": trip.get('direction_id', 'N/A')}
                         break
-            if found_trip_info:
-                break
-        if found_trip_info:
-            all_arrivals.append(found_trip_info)
+            if found_trip_info: break
+        if found_trip_info: all_arrivals.append(found_trip_info)
     now = datetime.now(pytz.timezone('Europe/Sofia'))
     seconds_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
     upcoming = [a for a in all_arrivals if get_seconds_from_midnight(a['arrival_time']) >= seconds_since_midnight]
@@ -176,12 +168,11 @@ def get_live_arrivals(stop_id):
 @app.route('/api/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
     full_schedule = schedule_by_trip.get(trip_id, [])
-    stops_with_details = [{"stop_id": st.get('stop_id'), "stop_name": stops_data.get(st.get('stop_id'), {}).get("stop_name"), "stop_lat": stops_data.get(st.get('stop_id'), {}).get("stop_lat"), "stop_lon": stops_data.get(st.get('stop_id'), {}).get("stop_lon")} for st in full_schedule if st.get('stop_id') in stops_data]
+    stops_with_details = [{"stop_id": st.get('stop_id'),"stop_name": stops_data.get(st.get('stop_id'), {}).get("stop_name"),"stop_lat": stops_data.get(st.get('stop_id'), {}).get("stop_lat"),"stop_lon": stops_data.get(st.get('stop_id'), {}).get("stop_lon")} for st in full_schedule if st.get('stop_id') in stops_data]
     return jsonify(stops_with_details)
 @app.route('/api/routes_for_stop/<stop_id>')
 def get_routes_for_stop(stop_id):
-    if stop_id not in arrivals_by_stop:
-        return jsonify([])
+    if stop_id not in arrivals_by_stop: return jsonify([])
     trip_ids = {arrival['trip_id'] for arrival in arrivals_by_stop[stop_id]}
     route_ids = set()
     for trip_id in trip_ids:
@@ -191,20 +182,16 @@ def get_routes_for_stop(stop_id):
     routes_for_this_stop = []
     for route_id in route_ids:
         route_info = routes_data.get(route_id)
-        if route_info:
-            routes_for_this_stop.append({"route_id": route_info.get('route_id'), "route_short_name": route_info.get('route_short_name')})
+        if route_info: routes_for_this_stop.append({"route_id": route_info.get('route_id'),"route_short_name": route_info.get('route_short_name')})
     return jsonify(routes_for_this_stop)
 @app.route('/api/all_stops')
-def get_all_stops():
-    return jsonify(list(stops_data.values()))
+def get_all_stops(): return jsonify(list(stops_data.values()))
 @app.route('/api/shape/<trip_id>')
 def get_shape_for_trip(trip_id):
     trip_info = trips_data.get(trip_id)
-    if not trip_info or 'shape_id' not in trip_info:
-        return jsonify({"error": "Маршрут не е намерен"}), 404
+    if not trip_info or 'shape_id' not in trip_info: return jsonify({"error": "Маршрут не е намерен"}), 404
     shape_points = shapes_data.get(trip_info['shape_id'])
-    if not shape_points:
-        return jsonify({"error": "Геометрия не е намерена"}), 404
+    if not shape_points: return jsonify({"error": "Геометрия не е намерена"}), 404
     return jsonify(shape_points)
 
 load_static_data()
