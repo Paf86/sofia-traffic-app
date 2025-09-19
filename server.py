@@ -5,102 +5,48 @@ from datetime import datetime, timedelta
 import pytz
 from flask_cors import CORS
 from bs4 import BeautifulSoup
-import os # <-- Уверете се, че този ред е тук
+import os
+import rarfile # <-- Добавяме import за новата библиотека
 
-# --- Това е най-важната част ---
+# --- Път до файловете (остава същият) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_PATH = BASE_DIR + "/"
-# ------------------------------------
 
 app = Flask(__name__)
 CORS(app)
 
-# (останалата част от кода е същата като преди)
-# Глобални структури за данни
+# --- НОВА ФУНКЦИЯ ЗА РАЗАРХИВИРАНЕ ---
+def unarchive_data_files():
+    """Проверява за .rar файлове и ги разархивира, ако е нужно."""
+    files_to_unarchive = ['stop_times.rar', 'shapes.rar']
+    for rar_filename in files_to_unarchive:
+        txt_filename = rar_filename.replace('.rar', '.txt')
+        rar_filepath = os.path.join(BASE_PATH, rar_filename)
+        txt_filepath = os.path.join(BASE_PATH, txt_filename)
+
+        # Проверяваме дали .rar файлът съществува И дали .txt файлът липсва
+        if os.path.exists(rar_filepath) and not os.path.exists(txt_filepath):
+            try:
+                print(f"[ДЕБЪГ] Намерен е '{rar_filename}'. Разархивирам...")
+                with rarfile.RarFile(rar_filepath) as rf:
+                    rf.extractall(path=BASE_PATH)
+                print(f"[ДЕБЪГ] '{rar_filename}' е разархивиран успешно в '{txt_filename}'.")
+            except Exception as e:
+                print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при разархивиране на '{rar_filename}': {e}")
+# --- КРАЙ НА НОВАТА ФУНКЦИЯ ---
+
+
+# Глобални структури за данни (остават същите)
 routes_data, trips_data, stops_data, arrivals_by_stop = {}, {}, {}, {}
 active_services, shapes_data, schedule_by_trip = set(), {}, {}
 
-def get_seconds_from_midnight(time_str):
-    try:
-        if 'мин' in time_str:
-            now = datetime.now(pytz.timezone('Europe/Sofia'))
-            minutes = int(time_str.split()[0])
-            arrival_time = now.hour * 3600 + now.minute * 60 + now.second + (minutes * 60)
-            return arrival_time
-        elif 'Пристига' in time_str:
-            return (datetime.now(pytz.timezone('Europe/Sofia')).hour * 3600 + 
-                    datetime.now(pytz.timezone('Europe/Sofia')).minute * 60 + 
-                    datetime.now(pytz.timezone('Europe/Sofia')).second)
-        parts = list(map(int, time_str.split(':')))
-        h, m, s = parts[0], parts[1], parts[2] if len(parts) > 2 else 0
-        return h * 3600 + m * 60 + s
-    except (ValueError, AttributeError, IndexError):
-        return 99999
-
-def fetch_from_sofia_traffic(stop_code):
-    if not stop_code:
-        print("[ДЕБЪГ] fetch_from_sofia_traffic извикан без stop_code.")
-        return []
-    
-    url = "https://www.sofiatraffic.bg/bg/schedules/stops-info"
-    payload = {'stop_code_q': stop_code}
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest'
-    }
-    
-    try:
-        print(f"[ДЕБЪГ] Изпращам POST заявка към {url} със stop_code: {stop_code}")
-        response = requests.post(url, data=payload, headers=headers, timeout=15)
-        print(f"[ДЕБЪГ] Получих отговор със статус код: {response.status_code}")
-
-        if response.status_code != 200:
-            return []
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        arrivals = []
-        
-        arrival_rows = soup.find_all('div', class_='arrival-row')
-        print(f"[ДЕБЪГ] Намерени редове с пристигания: {len(arrival_rows)}")
-        
-        for row in arrival_rows:
-            line_element = row.find('span', class_='line_number')
-            time_element = row.find('div', class_='time').find('span')
-
-            if line_element and time_element:
-                line_name = line_element.text.strip()
-                arrival_time_text = time_element.text.strip()
-                
-                now = datetime.now(pytz.timezone('Europe/Sofia'))
-                timing_str = now.strftime('%H:%M:%S')
-                
-                if 'мин' in arrival_time_text:
-                    try:
-                        minutes_to_add = int(arrival_time_text.split()[0])
-                        arrival_dt = now + timedelta(minutes=minutes_to_add)
-                        timing_str = arrival_dt.strftime('%H:%M:%S')
-                    except (ValueError, IndexError):
-                        pass
-                
-                arrivals.append({
-                    "lineName": line_name,
-                    "timing": timing_str
-                })
-        
-        print(f"[ДЕБЪГ] Успешно извлечени пристигания: {arrivals}")
-        return arrivals
-
-    except requests.RequestException as e:
-        print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при връзка: {e}")
-        return []
-    except Exception as e:
-        print(f"[ДЕБЪГ] ГРЕШКА при парсване на HTML: {e}")
-        return []
 
 def load_static_data():
+    """Зарежда всички статични GTFS данни от файлове при стартиране."""
     global routes_data, trips_data, stops_data, arrivals_by_stop, active_services, shapes_data, schedule_by_trip
     try:
         print(f"[ДЕБЪГ] Зареждам статични файлове от: {BASE_PATH}")
+        # ... (цялата останала част от тази функция е същата)
         with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f): routes_data[row['route_id']] = row
         with open(f'{BASE_PATH}trips.txt', mode='r', encoding='utf-8-sig') as f:
@@ -137,6 +83,67 @@ def load_static_data():
     except Exception as e:
         print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при зареждане на статични данни: {e}")
 
+# ... (всички останали функции като fetch_from_sofia_traffic и @app.route остават БЕЗ ПРОМЯНА) ...
+def get_seconds_from_midnight(time_str):
+    try:
+        if 'мин' in time_str:
+            now = datetime.now(pytz.timezone('Europe/Sofia'))
+            minutes = int(time_str.split()[0])
+            arrival_time = now.hour * 3600 + now.minute * 60 + now.second + (minutes * 60)
+            return arrival_time
+        elif 'Пристига' in time_str:
+            return (datetime.now(pytz.timezone('Europe/Sofia')).hour * 3600 +
+                    datetime.now(pytz.timezone('Europe/Sofia')).minute * 60 +
+                    datetime.now(pytz.timezone('Europe/Sofia')).second)
+        parts = list(map(int, time_str.split(':')))
+        h, m, s = parts[0], parts[1], parts[2] if len(parts) > 2 else 0
+        return h * 3600 + m * 60 + s
+    except (ValueError, AttributeError, IndexError):
+        return 99999
+def fetch_from_sofia_traffic(stop_code):
+    if not stop_code:
+        print("[ДЕБЪГ] fetch_from_sofia_traffic извикан без stop_code.")
+        return []
+    url = "https://www.sofiatraffic.bg/bg/schedules/stops-info"
+    payload = {'stop_code_q': stop_code}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest'
+    }
+    try:
+        print(f"[ДЕБЪГ] Изпращам POST заявка към {url} със stop_code: {stop_code}")
+        response = requests.post(url, data=payload, headers=headers, timeout=15)
+        print(f"[ДЕБЪГ] Получих отговор със статус код: {response.status_code}")
+        if response.status_code != 200:
+            return []
+        soup = BeautifulSoup(response.text, 'html.parser')
+        arrivals = []
+        arrival_rows = soup.find_all('div', class_='arrival-row')
+        print(f"[ДЕБЪГ] Намерени редове с пристигания: {len(arrival_rows)}")
+        for row in arrival_rows:
+            line_element = row.find('span', class_='line_number')
+            time_element = row.find('div', class_='time').find('span')
+            if line_element and time_element:
+                line_name = line_element.text.strip()
+                arrival_time_text = time_element.text.strip()
+                now = datetime.now(pytz.timezone('Europe/Sofia'))
+                timing_str = now.strftime('%H:%M:%S')
+                if 'мин' in arrival_time_text:
+                    try:
+                        minutes_to_add = int(arrival_time_text.split()[0])
+                        arrival_dt = now + timedelta(minutes=minutes_to_add)
+                        timing_str = arrival_dt.strftime('%H:%M:%S')
+                    except (ValueError, IndexError):
+                        pass
+                arrivals.append({"lineName": line_name, "timing": timing_str})
+        print(f"[ДЕБЪГ] Успешно извлечени пристигания: {arrivals}")
+        return arrivals
+    except requests.RequestException as e:
+        print(f"[ДЕБЪГ] КРИТИЧНА ГРЕШКА при връзка: {e}")
+        return []
+    except Exception as e:
+        print(f"[ДЕБЪГ] ГРЕШКА при парсване на HTML: {e}")
+        return []
 @app.route('/api/arrivals/<stop_id>')
 def get_live_arrivals(stop_id):
     stop_info = stops_data.get(stop_id)
@@ -194,4 +201,7 @@ def get_shape_for_trip(trip_id):
     if not shape_points: return jsonify({"error": "Геометрия не е намерена"}), 404
     return jsonify(shape_points)
 
+
+# --- КЛЮЧОВА ПРОМЯНА: Първо разархивираме, после зареждаме! ---
+unarchive_data_files()
 load_static_data()
