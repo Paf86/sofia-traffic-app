@@ -1,3 +1,0 @@
-fare_id,price,currency_type,payment_method,transfers,agency_id,transfer_duration
-A30,1.6,BGN,1,1800,A,1800
-A60,2.2,BGN,1,3600,A,3600
