@@ -16,7 +16,7 @@ CORS(app)
 
 # --- НОВА СЕКЦИЯ: ЛОКАЛНО РАЗАРХИВИРАНЕ НА ДАННИ ---
 # Път до ZIP файла, който е в хранилището
-ZIP_FILE_PATH = "gtfs_data.zip"
+ZIP_FILE_PATH = "gtfs-static.zip"
 
 # Път, където ще разархивираме данните. /tmp е стандартна временна директория в Render.
 DATA_DIR = "/tmp/gtfs_unzipped"
