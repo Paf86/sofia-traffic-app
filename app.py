@@ -370,17 +370,31 @@ def precompute_routes_by_line():
             processed_shapes_for_line.add(shape_id)
 
 # ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
-print("--- Сървърът стартира. Зареждане на статични данни...")
-load_static_data()
-print("--- Статичните данни са заредени. Предварително изчисляване на кешове...")
-precompute_all_route_details()
-precompute_routes_by_line()
-print("--- Кешовете са подготвени. Първоначално зареждане на данни в реално време...")
-refresh_realtime_cache_if_needed()
-print("--- Сървърът е готов за приемане на заявки. ---")
+
+def initialize_app():
+    """Функция, която ще се изпълни във фонова нишка, за да не блокира старта."""
+    print("--- [BG Thread] Фоновото инициализиране започва...")
+    print("--- [BG Thread] Зареждане на статични данни...")
+    load_static_data()
+    print("--- [BG Thread] Статичните данни са заредени. Предварително изчисляване на кешове...")
+    precompute_all_route_details()
+    precompute_routes_by_line()
+    print("--- [BG Thread] Кешовете са подготвени. Първоначално зареждане на данни в реално време...")
+    refresh_realtime_cache_if_needed()
+    print("--- [BG Thread] Сървърът е напълно готов за работа. ---")
+
+# Извикваме само функции, които не четат големи файлове и са бързи
+print("--- Основният процес стартира. Подготовка на фонова нишка...")
+
+# Стартираме тежките изчисления в отделна нишка, за да не блокираме Gunicorn
+init_thread = threading.Thread(target=initialize_app)
+init_thread.start()
+
+print("--- Сървърът е стартиран и слуша за заявки. Инициализацията продължава на заден фон...")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
-# (Всички ендпойнти оттук надолу са без промяна, освен /api/shape/<trip_id>)
+# (Всички ендпойнти остават същите)
+# ...
 
 @app.route('/api/shape/<trip_id>')
 def get_shape_for_trip(trip_id):
@@ -833,3 +847,4 @@ def debug_alerts():
     except Exception as e:
 
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
+
