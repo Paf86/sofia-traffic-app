@@ -29,7 +29,6 @@ weekday_schedule_ids, holiday_schedule_ids = set(), set()
 sofia_tz = pytz.timezone('Europe/Sofia')
 precomputed_route_details_cache, routes_by_line_cache = None, None
 initialization_lock = threading.Lock()
-shapes_data_cache, shapes_data_lock = {}, threading.Lock()
 ARRIVAL_ZONE_METERS, DEPARTURE_ZONE_METERS, HYBRID_TRIGGER_ZONE_METERS = 50, 70, 20
 AVG_SPEED_MPS = {'0': 6.9, '3': 5.5, '11': 6.0, 'DEFAULT': 5.5}
 
@@ -63,22 +62,19 @@ def refresh_realtime_cache_if_needed():
             except requests.RequestException as e: print(f"КРИТИЧНА ГРЕШКА при мрежова заявка: {e}", file=sys.stderr)
 
 def get_shape_by_id(shape_id):
-    if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
-    with shapes_data_lock:
-        if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
-        print(f"--- [Lazy Load] Зареждане на shape '{shape_id}'...", file=sys.stderr)
-        shape_points = []
-        try:
-            with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row['shape_id'] == shape_id:
-                        shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
-            if shape_points: shapes_data_cache[shape_id] = shape_points
-            return shape_points
-        except Exception as e:
-            print(f"Грешка при четене на shapes.txt: {e}", file=sys.stderr)
-            return []
+    # Тази функция вече не кешира в паметта, а чете файла всеки път.
+    # Това е по-бавно, но драстично намалява използването на RAM.
+    shape_points = []
+    try:
+        with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['shape_id'] == shape_id:
+                    shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
+        return shape_points
+    except Exception as e:
+        print(f"Грешка при четене на shapes.txt: {e}", file=sys.stderr)
+        return []
 
 def get_processed_alerts():
     if not alerts_feed_cache: return {}
@@ -217,27 +213,24 @@ def _build_routes_by_line():
             routes_by_line_cache[line_num][r_type].append(variation_data)
             processed_shapes.add(s_id)
 
-def ensure_route_details_cache():
-    global precomputed_route_details_cache
-    if precomputed_route_details_cache is None:
-        with initialization_lock:
-            if precomputed_route_details_cache is None:
-                print("--- [Lazy Init] Изграждане на precomputed_route_details_cache...")
-                start_time = time.time()
-                precomputed_route_details_cache = {}
-                _build_precomputed_route_details()
-                print(f"--- [Lazy Init] precomputed_route_details_cache е готов за {time.time() - start_time:.2f} сек.")
-
-def ensure_routes_by_line_cache():
-    global routes_by_line_cache
-    if routes_by_line_cache is None:
-        with initialization_lock:
-            if routes_by_line_cache is None:
-                print("--- [Lazy Init] Изграждане на routes_by_line_cache...")
-                start_time = time.time()
-                routes_by_line_cache = {}
-                _build_routes_by_line()
-                print(f"--- [Lazy Init] routes_by_line_cache е готов за {time.time() - start_time:.2f} сек.")
+def ensure_caches_are_built():
+    if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
+        return
+    with initialization_lock:
+        if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
+            return
+        print("--- [Lazy Init] Първа заявка. Започва изграждане на тежките кешове...")
+        start_time = time.time()
+        # Извикваме двете функции, които вече имат global декларации в тях
+        global precomputed_route_details_cache
+        precomputed_route_details_cache = {}
+        _build_precomputed_route_details()
+        
+        global routes_by_line_cache
+        routes_by_line_cache = {}
+        _build_routes_by_line()
+        end_time = time.time()
+        print(f"--- [Lazy Init] Тежките кешове са изградени за {end_time - start_time:.2f} секунди.")
 
 # ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
 print("--- Сървърът стартира. Зареждане на основни статични данни...")
@@ -249,11 +242,9 @@ print("--- Сървърът е готов. Тежките кешове ще се
 # ----------------- API ЕНДПОЙНТИ -----------------
 @app.before_request
 def before_request_func():
-    # Тази функция проверява дали тежките кешове са изградени, само ако заявката не е за дебъг
-    if 'debug' not in request.path:
-        # Извикваме и двете, за да сме сигурни. Lock-ът вътре ще предотврати двойна работа.
-        ensure_route_details_cache()
-        ensure_routes_by_line_cache()
+    if 'debug' in request.path:
+        return
+    ensure_caches_are_built()
 
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
@@ -479,7 +470,6 @@ def get_shape_for_trip(trip_id):
 
 @app.route('/api/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
-    ensure_route_details_cache()
     if trip_id not in trip_stops_sequence: return jsonify({"error": "Trip not found"}), 404
     stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence']}) for s in trip_stops_sequence.get(trip_id, []) if stops_data.get(s['stop_id'])]
     return jsonify(stops_list)
@@ -500,7 +490,6 @@ def get_all_stops():
 
 @app.route('/api/all_lines_structured')
 def get_all_lines_structured():
-    ensure_routes_by_line_cache()
     try:
         final_list = []
         for line_num, types in routes_by_line_cache.items():
@@ -519,7 +508,6 @@ def get_all_lines_structured():
 
 @app.route('/api/line_details/<line_number>/<route_type_code>')
 def get_line_details(line_number, route_type_code):
-    ensure_routes_by_line_cache()
     line_data = routes_by_line_cache.get(line_number, {}).get(route_type_code, [])
     if not line_data:
         return jsonify({"error": f"Няма данни за линия {line_number}."}), 404
@@ -527,7 +515,6 @@ def get_line_details(line_number, route_type_code):
 
 @app.route('/api/full_route_view/<trip_id>')
 def get_full_route_view(trip_id):
-    ensure_route_details_cache()
     try:
         cached_data = precomputed_route_details_cache.get(trip_id)
         if not cached_data: return jsonify({"error": f"Static route details not found for trip {trip_id}."}), 404
@@ -554,7 +541,6 @@ def get_full_route_view(trip_id):
 
 @app.route('/api/static_route_view/<trip_id>')
 def get_static_route_view(trip_id):
-    ensure_route_details_cache()
     cached_data = precomputed_route_details_cache.get(trip_id)
     if not cached_data: return jsonify({"error": f"Static route details not found for trip {trip_id}."}), 404
     return jsonify({"shape": cached_data.get("shape", []), "stops": cached_data.get("stops", [])})
