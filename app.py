@@ -218,23 +218,23 @@ def _build_routes_by_line():
             processed_shapes.add(s_id)
 
 def ensure_route_details_cache():
+    global precomputed_route_details_cache
     if precomputed_route_details_cache is None:
         with initialization_lock:
             if precomputed_route_details_cache is None:
                 print("--- [Lazy Init] Изграждане на precomputed_route_details_cache...")
                 start_time = time.time()
-                global precomputed_route_details_cache
                 precomputed_route_details_cache = {}
                 _build_precomputed_route_details()
                 print(f"--- [Lazy Init] precomputed_route_details_cache е готов за {time.time() - start_time:.2f} сек.")
 
 def ensure_routes_by_line_cache():
+    global routes_by_line_cache
     if routes_by_line_cache is None:
         with initialization_lock:
             if routes_by_line_cache is None:
                 print("--- [Lazy Init] Изграждане на routes_by_line_cache...")
                 start_time = time.time()
-                global routes_by_line_cache
                 routes_by_line_cache = {}
                 _build_routes_by_line()
                 print(f"--- [Lazy Init] routes_by_line_cache е готов за {time.time() - start_time:.2f} сек.")
@@ -247,6 +247,14 @@ refresh_realtime_cache_if_needed()
 print("--- Сървърът е готов. Тежките кешове ще се изградят при първа нужда. ---")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
+@app.before_request
+def before_request_func():
+    # Тази функция проверява дали тежките кешове са изградени, само ако заявката не е за дебъг
+    if 'debug' not in request.path:
+        # Извикваме и двете, за да сме сигурни. Lock-ът вътре ще предотврати двойна работа.
+        ensure_route_details_cache()
+        ensure_routes_by_line_cache()
+
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
     try:
@@ -364,6 +372,7 @@ def get_bulk_detailed_arrivals():
         return jsonify(final_results)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_bulk_detailed_arrivals: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/api/bulk_arrivals_for_stops', methods=['POST'])
@@ -405,6 +414,7 @@ def get_bulk_arrivals_for_stops():
         return jsonify({c: {'arrivals': list(d['arrivals'])} for c, d in bulk_results.items()})
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_bulk_arrivals_for_stops: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/api/schedule_for_stop/<stop_code>')
@@ -436,6 +446,7 @@ def get_schedule_for_stop(stop_code):
         return jsonify(schedule)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_schedule_for_stop: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/api/vehicles_for_routes/<route_names_str>')
