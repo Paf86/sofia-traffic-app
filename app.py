@@ -29,7 +29,6 @@ weekday_schedule_ids, holiday_schedule_ids = set(), set()
 sofia_tz = pytz.timezone('Europe/Sofia')
 precomputed_route_details_cache, routes_by_line_cache = None, None
 initialization_lock = threading.Lock()
-shapes_data_cache, shapes_data_lock = {}, threading.Lock()
 ARRIVAL_ZONE_METERS, DEPARTURE_ZONE_METERS, HYBRID_TRIGGER_ZONE_METERS = 50, 70, 20
 AVG_SPEED_MPS = {'0': 6.9, '3': 5.5, '11': 6.0, 'DEFAULT': 5.5}
 
@@ -61,24 +60,6 @@ def refresh_realtime_cache_if_needed():
                 last_cache_update_timestamp = time.time()
                 print(f"--- [CACHE] Обновяването приключи за {(time.time() - start_time) * 1000:.2f} мс.", file=sys.stderr)
             except requests.RequestException as e: print(f"КРИТИЧНА ГРЕШКА при мрежова заявка: {e}", file=sys.stderr)
-
-def get_shape_by_id(shape_id):
-    if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
-    with shapes_data_lock:
-        if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
-        print(f"--- [Lazy Load] Зареждане на shape '{shape_id}'...", file=sys.stderr)
-        shape_points = []
-        try:
-            with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row['shape_id'] == shape_id:
-                        shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
-            if shape_points: shapes_data_cache[shape_id] = shape_points
-            return shape_points
-        except Exception as e:
-            print(f"Грешка при четене на shapes.txt: {e}", file=sys.stderr)
-            return []
 
 def get_processed_alerts():
     if not alerts_feed_cache: return {}
@@ -178,17 +159,30 @@ def parse_gtfs_time(time_str, service_date, tz):
         return tz.localize(datetime(service_date.year, service_date.month, service_date.day) + timedelta(hours=h, minutes=m, seconds=s))
     except: return None
 
-def _build_precomputed_route_details():
+def _load_all_shapes_temporarily():
+    print("--- [Lazy Init] Зареждане на shapes.txt в паметта временно...", file=sys.stderr)
+    all_shapes = {}
+    with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            shape_id = row['shape_id']
+            if shape_id not in all_shapes:
+                all_shapes[shape_id] = []
+            all_shapes[shape_id].append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
+    print("--- [Lazy Init] shapes.txt е зареден временно.", file=sys.stderr)
+    return all_shapes
+
+def _build_precomputed_route_details(all_shapes):
     global precomputed_route_details_cache
     for t_id, t_info in trips_data.items():
         s_id = t_info.get('shape_id')
         if not s_id: continue
-        shape_points = get_shape_by_id(s_id)
+        shape_points = all_shapes.get(s_id, [])
         if not shape_points or t_id not in trip_stops_sequence: continue
         stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence'], 'service_types': sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))}) for s in trip_stops_sequence.get(t_id, []) if stops_data.get(s['stop_id'])]
         if stops_list: precomputed_route_details_cache[t_id] = {"shape": shape_points, "stops": stops_list}
 
-def _build_routes_by_line():
+def _build_routes_by_line(all_shapes):
     global routes_by_line_cache
     lines_to_trips = {}
     for t_id, t_info in trips_data.items():
@@ -207,7 +201,7 @@ def _build_routes_by_line():
             if not t_info or t_info.get('trip_headsign') not in main_headsigns: continue
             s_id = t_info.get('shape_id')
             if not s_id or s_id in processed_shapes: continue
-            shape_points = get_shape_by_id(s_id)
+            shape_points = all_shapes.get(s_id, [])
             if not shape_points: continue
             stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence'], 'service_types': sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))}) for s in trip_stops_sequence.get(t_id,[]) if stops_data.get(s['stop_id'])]
             if not stops_list: continue
@@ -228,12 +222,17 @@ def ensure_caches_are_built():
         print("--- [Lazy Init] Първа заявка. Започва изграждане на тежките кешове...")
         start_time = time.time()
         
-        # Правим ги празни речници, преди да ги подадем на функциите
+        # Зареждаме shapes.txt само временно
+        all_shapes_temp = _load_all_shapes_temporarily()
+        
         precomputed_route_details_cache = {}
+        _build_precomputed_route_details(all_shapes_temp)
+        
         routes_by_line_cache = {}
-
-        _build_precomputed_route_details()
-        _build_routes_by_line()
+        _build_routes_by_line(all_shapes_temp)
+        
+        # Освобождаваме паметта, заета от shapes
+        del all_shapes_temp
         
         end_time = time.time()
         print(f"--- [Lazy Init] Тежките кешове са изградени за {end_time - start_time:.2f} секунди.")
