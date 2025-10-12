@@ -31,7 +31,6 @@ trip_updates_feed_cache = None
 vehicle_positions_feed_cache = None
 alerts_feed_cache = None
 last_cache_update_timestamp = 0
-is_data_loaded = False # <-- НОВ ФЛАГ ЗА ГОТОВНОСТ
 
 # --- Глобални статични данни ---
 routes_data, trips_data, stops_data, active_services = {}, {}, {}, set()
@@ -41,9 +40,10 @@ trip_stop_sequences_map = {}
 weekday_schedule_ids, holiday_schedule_ids = set(), set()
 sofia_tz = pytz.timezone('Europe/Sofia')
 
-# --- ГЛАВНИ КЕШОВЕ ЗА МАРШРУТИ ---
-precomputed_route_details_cache = {}
-routes_by_line_cache = {}
+# --- ГЛАВНИ КЕШОВЕ ЗА МАРШРУТИ (Ще се инициализират "мързеливо") ---
+precomputed_route_details_cache = None
+routes_by_line_cache = None
+initialization_lock = threading.Lock()
 
 # --- КОНСТАНТИ ---
 ARRIVAL_ZONE_METERS = 50
@@ -71,25 +71,21 @@ def refresh_realtime_cache_if_needed():
             try:
                 print(f"--- [CACHE] Кешът е изтекъл. Започва обновяване...", file=sys.stderr)
                 start_time = time.time()
-                
                 proxy_url_updates = "https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed=trip-updates"
                 response_updates = requests.get(proxy_url_updates, timeout=15)
                 if response_updates.status_code == 200:
                     trip_updates_feed_cache = gtfs_realtime_pb2.FeedMessage()
                     trip_updates_feed_cache.ParseFromString(response_updates.content)
-
                 proxy_url_positions = "https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed=vehicle-positions"
                 response_positions = requests.get(proxy_url_positions, timeout=15)
                 if response_positions.status_code == 200:
                     vehicle_positions_feed_cache = gtfs_realtime_pb2.FeedMessage()
                     vehicle_positions_feed_cache.ParseFromString(response_positions.content)
-
                 proxy_url_alerts = "https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed=alerts"
                 response_alerts = requests.get(proxy_url_alerts, timeout=15)
                 if response_alerts.status_code == 200:
                     alerts_feed_cache = gtfs_realtime_pb2.FeedMessage()
                     alerts_feed_cache.ParseFromString(response_alerts.content)
-
                 last_cache_update_timestamp = time.time()
                 end_time = time.time()
                 print(f"--- [CACHE] Обновяването приключи за {(end_time - start_time) * 1000:.2f} мс.", file=sys.stderr)
@@ -101,11 +97,9 @@ shapes_data_lock = threading.Lock()
 
 def get_shape_by_id(shape_id):
     global shapes_data_cache
-    if shape_id in shapes_data_cache:
-        return shapes_data_cache[shape_id]
+    if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
     with shapes_data_lock:
-        if shape_id in shapes_data_cache:
-            return shapes_data_cache[shape_id]
+        if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
         print(f"--- [Lazy Load] Зареждане на shape '{shape_id}' от файла...", file=sys.stderr)
         shape_points = []
         try:
@@ -114,8 +108,7 @@ def get_shape_by_id(shape_id):
                 for row in reader:
                     if row['shape_id'] == shape_id:
                         shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
-            if shape_points:
-                shapes_data_cache[shape_id] = shape_points
+            if shape_points: shapes_data_cache[shape_id] = shape_points
             return shape_points
         except FileNotFoundError:
             print("КРИТИЧНА ГРЕШКА: shapes.txt не е намерен!", file=sys.stderr)
@@ -127,12 +120,9 @@ def get_shape_by_id(shape_id):
 def get_processed_alerts():
     if not alerts_feed_cache: return {}
     alerts_by_composite_key = {}
-    routes_by_short_name = {}
+    routes_by_short_name = {r_info.get('route_short_name'): [] for r_id, r_info in routes_data.items()}
     for r_id, r_info in routes_data.items():
-        name = r_info.get('route_short_name')
-        if name:
-            if name not in routes_by_short_name: routes_by_short_name[name] = []
-            routes_by_short_name[name].append(r_info)
+        if r_info.get('route_short_name'): routes_by_short_name[r_info.get('route_short_name')].append(r_info)
     def add_alert_to_route(route_info, alert_text):
         if route_info:
             route_name, route_type = route_info.get('route_short_name'), route_info.get('route_type')
@@ -145,21 +135,17 @@ def get_processed_alerts():
             alert = entity.alert
             alert_text = "Няма подробно описание."
             if alert.HasField('description_text') and alert.description_text.translation:
-                html_text = alert.description_text.translation[0].text
-                soup = BeautifulSoup(html_text, "html.parser")
+                soup = BeautifulSoup(alert.description_text.translation[0].text, "html.parser")
                 alert_text = soup.get_text(separator='\n').strip()
             if alert_text:
-                pattern = r"(трамвайн\w+|автобусн\w+|тролейбусн\w+)\s+(?:линия|линии)\s+№\s+([\d\s,и]+)"
-                matches = re.findall(pattern, alert_text, re.IGNORECASE)
+                matches = re.findall(r"(трамвайн\w+|автобусн\w+|тролейбусн\w+)\s+(?:линия|линии)\s+№\s+([\d\s,и]+)", alert_text, re.IGNORECASE)
                 type_map = {'0':'трамвайн', '3':'автобусн', '11':'тролейбусн'}
                 for v_type_str, names_str in matches:
-                    v_type_prefix = v_type_str.lower()[:9]
                     for code, prefix in type_map.items():
-                        if v_type_prefix.startswith(prefix):
+                        if v_type_str.lower().startswith(prefix):
                             for name in set(n for n in re.split(r'[\s,и]+', names_str) if n):
-                                if name in routes_by_short_name:
-                                    for r_info in routes_by_short_name[name]:
-                                        if r_info.get('route_type') == code: add_alert_to_route(r_info, alert_text)
+                                for r_info in routes_by_short_name.get(name, []):
+                                    if r_info.get('route_type') == code: add_alert_to_route(r_info, alert_text)
                             break
             for informed_entity in alert.informed_entity:
                 if informed_entity.HasField('route_id'): add_alert_to_route(routes_data.get(informed_entity.route_id), alert_text)
@@ -167,9 +153,8 @@ def get_processed_alerts():
                     trip_info = trips_data.get(informed_entity.trip.trip_id)
                     if trip_info and 'route_id' in trip_info: add_alert_to_route(routes_data.get(trip_info['route_id']), alert_text)
                 elif informed_entity.HasField('stop_id'):
-                    trip_ids = stop_to_trips_map.get(informed_entity.stop_id, [])
-                    route_ids = {trips_data[t_id]['route_id'] for t_id in trip_ids if t_id in trips_data and 'route_id' in trips_data[t_id]}
-                    for r_id in route_ids: add_alert_to_route(routes_data.get(r_id), alert_text)
+                    for t_id in stop_to_trips_map.get(informed_entity.stop_id, []):
+                        if t_id in trips_data and 'route_id' in trips_data[t_id]: add_alert_to_route(routes_data.get(trips_data[t_id]['route_id']), alert_text)
     return alerts_by_composite_key
 
 def load_static_data():
@@ -186,43 +171,40 @@ def load_static_data():
                 try:
                     t_id, s_id = r['trip_id'], r['stop_id']
                     used_stop_ids.add(s_id)
-                    s_seq = int(r['stop_sequence'])
                     if t_id not in schedule_by_trip: schedule_by_trip[t_id] = {}
                     schedule_by_trip[t_id][s_id] = r['arrival_time']
                     if t_id not in trip_stops_sequence: trip_stops_sequence[t_id] = []
-                    trip_stops_sequence[t_id].append({'stop_id': s_id, 'stop_sequence': s_seq})
+                    trip_stops_sequence[t_id].append({'stop_id': s_id, 'stop_sequence': int(r['stop_sequence'])})
                     if t_id not in trip_stop_sequences_map: trip_stop_sequences_map[t_id] = {}
-                    trip_stop_sequences_map[t_id][s_id] = s_seq
+                    trip_stop_sequences_map[t_id][s_id] = int(r['stop_sequence'])
                     if s_id not in stop_to_trips_map: stop_to_trips_map[s_id] = []
                     stop_to_trips_map[s_id].append(t_id)
                     trip_info = trips_data.get(t_id)
-                    if trip_info:
+                    if trip_info and s_id not in stop_service_info: stop_service_info[s_id] = {'types': set()}
+                    if trip_info and 'route_id' in trip_info:
                         route_info = routes_data.get(trip_info['route_id'])
                         if route_info:
-                            if s_id not in stop_service_info: stop_service_info[s_id] = {'types': set()}
                             r_type = route_info.get('route_type')
-                            type_map = {'0':'TRAM', '3':'BUS', '11':'TROLLEY'}
-                            transport_type = type_map.get(r_type)
+                            transport_type = {'0':'TRAM', '3':'BUS', '11':'TROLLEY'}.get(r_type)
                             if route_info.get('route_short_name','').startswith('N'): transport_type = 'NIGHT'
                             if transport_type: stop_service_info[s_id]['types'].add(transport_type)
                 except (ValueError, KeyError) as e: print(f"Проблемен ред в stop_times.txt: {r}. Грешка: {e}", file=sys.stderr)
         for t_id in trip_stops_sequence: trip_stops_sequence[t_id].sort(key=lambda x: x['stop_sequence'])
         with open(f'{BASE_PATH}stops.txt', mode='r', encoding='utf-8-sig') as f: stops_data = {r['stop_id']: r for r in csv.DictReader(f) if r['stop_id'] in used_stop_ids}
-        active_services.clear()
         with open(f'{BASE_PATH}calendar_dates.txt', 'r', encoding='utf-8-sig') as f: calendar_dates_rows = list(csv.DictReader(f))
+        active_services.clear()
         today_str = datetime.now(sofia_tz).strftime('%Y%m%d')
         is_today_holiday = any(r['date'] == today_str and r.get('exception_type') == '1' for r in calendar_dates_rows)
         all_service_ids = {t['service_id'] for t in trips_data.values()}
-        original_holiday_ids = {r['service_id'] for r in calendar_dates_rows if r.get('exception_type') == '1'}
-        if is_today_holiday: active_services.update(original_holiday_ids)
-        else: active_services.update(all_service_ids - original_holiday_ids)
+        holiday_service_ids = {r['service_id'] for r in calendar_dates_rows if r.get('exception_type') == '1'}
+        if is_today_holiday: active_services.update(holiday_service_ids)
+        else: active_services.update(all_service_ids - holiday_service_ids)
         for r in calendar_dates_rows:
             if r['date'] == today_str:
                 if r['exception_type'] == '1': active_services.add(r['service_id'])
                 elif r['exception_type'] == '2': active_services.discard(r['service_id'])
         for r in calendar_dates_rows:
-            if datetime.strptime(r['date'], '%Y%m%d').weekday() >= 5: holiday_schedule_ids.add(str(r['service_id']))
-            else: weekday_schedule_ids.add(str(r['service_id']))
+            (holiday_schedule_ids if datetime.strptime(r['date'], '%Y%m%d').weekday() >= 5 else weekday_schedule_ids).add(str(r['service_id']))
         print(f"Заредени са {len(active_services)} активни услуги. {len(weekday_schedule_ids)} делнични и {len(holiday_schedule_ids)} празнични.", file=sys.stderr)
     except FileNotFoundError as e:
         print(f"КРИТИЧНА ГРЕШКА: Файлът {e.filename} не е намерен.", file=sys.stderr)
@@ -235,7 +217,7 @@ def parse_gtfs_time(time_str: str, service_date: datetime, tz: pytz.timezone):
         return tz.localize(datetime(service_date.year, service_date.month, service_date.day) + timedelta(hours=h, minutes=m, seconds=s))
     except (ValueError, IndexError, TypeError): return None
 
-def precompute_all_route_details():
+def _build_precomputed_route_details():
     global precomputed_route_details_cache
     for t_id, t_info in trips_data.items():
         s_id = t_info.get('shape_id')
@@ -251,7 +233,7 @@ def precompute_all_route_details():
                 stops_list.append(s_copy)
         if stops_list: precomputed_route_details_cache[t_id] = {"shape": shape_points, "stops": stops_list}
 
-def precompute_routes_by_line():
+def _build_routes_by_line():
     global routes_by_line_cache
     lines_to_trips = {}
     for t_id, t_info in trips_data.items():
@@ -289,30 +271,34 @@ def precompute_routes_by_line():
             routes_by_line_cache[line_num][r_type].append(variation_data)
             processed_shapes.add(s_id)
 
-# ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
-def initialize_app():
-    global is_data_loaded
-    print("--- [BG Thread] Фоновото инициализиране започва...")
-    print("--- [BG Thread] Зареждане на статични данни...")
-    load_static_data()
-    print("--- [BG Thread] Статичните данни са заредени. Предварително изчисляване на кешове...")
-    precompute_all_route_details()
-    precompute_routes_by_line()
-    print("--- [BG Thread] Кешовете са подготвени. Първоначално зареждане на данни в реално време...")
-    refresh_realtime_cache_if_needed()
-    is_data_loaded = True
-    print("--- [BG Thread] Сървърът е напълно готов за работа. ---")
+def ensure_caches_are_built():
+    global precomputed_route_details_cache, routes_by_line_cache
+    if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
+        return
+    with initialization_lock:
+        if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
+            return
+        print("--- [Lazy Init] Първа заявка. Започва изграждане на тежките кешове...")
+        start_time = time.time()
+        precomputed_route_details_cache, routes_by_line_cache = {}, {}
+        _build_precomputed_route_details()
+        _build_routes_by_line()
+        end_time = time.time()
+        print(f"--- [Lazy Init] Тежките кешове са изградени за {end_time - start_time:.2f} секунди.")
 
-print("--- Основният процес стартира. Подготовка на фонова нишка...")
-init_thread = threading.Thread(target=initialize_app)
-init_thread.start()
-print("--- Сървърът е стартиран и слуша за заявки. Инициализацията продължава на заден фон...")
+# ----------------- СТАРТИРАНЕ НА СЪРВЪРА (Бърза версия) -----------------
+print("--- Сървърът стартира. Зареждане на основни статични данни...")
+load_static_data()
+print("--- Основните данни са заредени. Първоначално зареждане на данни в реално време...")
+refresh_realtime_cache_if_needed()
+print("--- Сървърът е готов за приемане на заявки. Тежките кешове ще се изградят при първа заявка. ---")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
 @app.before_request
 def before_request_func():
-    if not is_data_loaded:
-        return jsonify({"error": "Server is initializing, please try again in a moment."}), 503
+    if 'debug' in request.path:
+        return
+    ensure_caches_are_built()
 
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
@@ -575,7 +561,6 @@ def get_all_lines_structured():
                 elif r_type == '11': transport_type = 'TROLLEY'
                 elif r_type in ['1','2']: transport_type = 'METRO'
                 structured_lines[r_id] = {"line_name": r_name, "transport_type": transport_type, "directions": {}}
-        # Оптимизация: Втори цикъл за попълване на посоките, за да се избегнат многократни проверки
         for t_id, t_info in trips_data.items():
             r_id = t_info.get('route_id')
             if r_id in structured_lines:
