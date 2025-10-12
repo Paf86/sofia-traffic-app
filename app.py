@@ -20,87 +20,58 @@ CORS(app)
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__)) + "/"
 
-# --- Секция за кеширане ---
+# --- Глобални променливи ---
 CACHE_DURATION_SECONDS = 15
-recent_official_arrivals_cache = {}
-RECENT_OFFICIAL_TTL_SECONDS = 90
-gps_arrival_cache = {}
-GPS_CACHE_TTL_SECONDS = 300
+recent_official_arrivals_cache, gps_arrival_cache = {}, {}
+RECENT_OFFICIAL_TTL_SECONDS, GPS_CACHE_TTL_SECONDS = 90, 300
 shared_data_lock = threading.Lock()
-trip_updates_feed_cache = None
-vehicle_positions_feed_cache = None
-alerts_feed_cache = None
+trip_updates_feed_cache, vehicle_positions_feed_cache, alerts_feed_cache = None, None, None
 last_cache_update_timestamp = 0
-
-# --- Глобални статични данни ---
 routes_data, trips_data, stops_data, active_services = {}, {}, {}, set()
 schedule_by_trip, trip_stops_sequence, stop_to_trips_map = {}, {}, {}
-stop_service_info = {}
-trip_stop_sequences_map = {}
+stop_service_info, trip_stop_sequences_map = {}, {}
 weekday_schedule_ids, holiday_schedule_ids = set(), set()
 sofia_tz = pytz.timezone('Europe/Sofia')
-
-# --- ГЛАВНИ КЕШОВЕ ЗА МАРШРУТИ (Ще се инициализират "мързеливо") ---
-precomputed_route_details_cache = None
-routes_by_line_cache = None
+precomputed_route_details_cache, routes_by_line_cache = None, None
 initialization_lock = threading.Lock()
-
-# --- КОНСТАНТИ ---
-ARRIVAL_ZONE_METERS = 50
-DEPARTURE_ZONE_METERS = 70
-HYBRID_TRIGGER_ZONE_METERS = 20
+shapes_data_cache, shapes_data_lock = {}, threading.Lock()
+ARRIVAL_ZONE_METERS, DEPARTURE_ZONE_METERS, HYBRID_TRIGGER_ZONE_METERS = 50, 70, 20
 AVG_SPEED_MPS = {'0': 6.9, '3': 5.5, '11': 6.0, 'DEFAULT': 5.5}
 
-# --- ХЕЛПЕР ФУНКЦИИ ---
+# --- Хелпър функции ---
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371000
     try:
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        delta_phi = math.radians(lat2 - lat1)
-        delta_lambda = math.radians(lon2 - lon1)
+        phi1, phi2, delta_phi, delta_lambda = map(math.radians, [lat1, lat2, lat2 - lat1, lon2 - lon1])
         a = math.sin(delta_phi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        return R * c
-    except (ValueError, TypeError):
-        return None
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    except (ValueError, TypeError): return None
 
 def refresh_realtime_cache_if_needed():
     global trip_updates_feed_cache, vehicle_positions_feed_cache, alerts_feed_cache, last_cache_update_timestamp
     with shared_data_lock:
         if time.time() - last_cache_update_timestamp > CACHE_DURATION_SECONDS:
             try:
-                print(f"--- [CACHE] Кешът е изтекъл. Започва обновяване...", file=sys.stderr)
+                print(f"--- [CACHE] Обновяване на live данни...", file=sys.stderr)
                 start_time = time.time()
-                proxy_url_updates = "https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed=trip-updates"
-                response_updates = requests.get(proxy_url_updates, timeout=15)
-                if response_updates.status_code == 200:
-                    trip_updates_feed_cache = gtfs_realtime_pb2.FeedMessage()
-                    trip_updates_feed_cache.ParseFromString(response_updates.content)
-                proxy_url_positions = "https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed=vehicle-positions"
-                response_positions = requests.get(proxy_url_positions, timeout=15)
-                if response_positions.status_code == 200:
-                    vehicle_positions_feed_cache = gtfs_realtime_pb2.FeedMessage()
-                    vehicle_positions_feed_cache.ParseFromString(response_positions.content)
-                proxy_url_alerts = "https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed=alerts"
-                response_alerts = requests.get(proxy_url_alerts, timeout=15)
-                if response_alerts.status_code == 200:
-                    alerts_feed_cache = gtfs_realtime_pb2.FeedMessage()
-                    alerts_feed_cache.ParseFromString(response_alerts.content)
+                for feed_name in ["trip-updates", "vehicle-positions", "alerts"]:
+                    url = f"https://sofia-traffic-proxy.pavel-manahilov-box.workers.dev/?feed={feed_name}"
+                    response = requests.get(url, timeout=15)
+                    if response.status_code == 200:
+                        feed = gtfs_realtime_pb2.FeedMessage()
+                        feed.ParseFromString(response.content)
+                        if feed_name == "trip-updates": trip_updates_feed_cache = feed
+                        elif feed_name == "vehicle-positions": vehicle_positions_feed_cache = feed
+                        else: alerts_feed_cache = feed
                 last_cache_update_timestamp = time.time()
-                end_time = time.time()
-                print(f"--- [CACHE] Обновяването приключи за {(end_time - start_time) * 1000:.2f} мс.", file=sys.stderr)
-            except requests.RequestException as e:
-                print(f"КРИТИЧНА ГРЕШКА при мрежова заявка към прокси: {e}", file=sys.stderr)
-
-shapes_data_cache = {}
-shapes_data_lock = threading.Lock()
+                print(f"--- [CACHE] Обновяването приключи за {(time.time() - start_time) * 1000:.2f} мс.", file=sys.stderr)
+            except requests.RequestException as e: print(f"КРИТИЧНА ГРЕШКА при мрежова заявка: {e}", file=sys.stderr)
 
 def get_shape_by_id(shape_id):
-    global shapes_data_cache
     if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
     with shapes_data_lock:
         if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
-        print(f"--- [Lazy Load] Зареждане на shape '{shape_id}' от файла...", file=sys.stderr)
+        print(f"--- [Lazy Load] Зареждане на shape '{shape_id}'...", file=sys.stderr)
         shape_points = []
         try:
             with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
@@ -110,50 +81,45 @@ def get_shape_by_id(shape_id):
                         shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
             if shape_points: shapes_data_cache[shape_id] = shape_points
             return shape_points
-        except FileNotFoundError:
-            print("КРИТИЧНА ГРЕШКА: shapes.txt не е намерен!", file=sys.stderr)
-            return []
-        except (ValueError, KeyError) as e:
-            print(f"Проблемен ред в shapes.txt. Грешка: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Грешка при четене на shapes.txt: {e}", file=sys.stderr)
             return []
 
 def get_processed_alerts():
     if not alerts_feed_cache: return {}
     alerts_by_composite_key = {}
-    routes_by_short_name = {r_info.get('route_short_name'): [] for r_id, r_info in routes_data.items()}
+    routes_by_short_name = {}
     for r_id, r_info in routes_data.items():
-        if r_info.get('route_short_name'): routes_by_short_name[r_info.get('route_short_name')].append(r_info)
+        name = r_info.get('route_short_name')
+        if name and name not in routes_by_short_name: routes_by_short_name[name] = []
+        if name: routes_by_short_name[name].append(r_info)
     def add_alert_to_route(route_info, alert_text):
         if route_info:
-            route_name, route_type = route_info.get('route_short_name'), route_info.get('route_type')
-            if route_name and route_type:
-                composite_key = f"{route_name}-{route_type}"
-                if composite_key not in alerts_by_composite_key: alerts_by_composite_key[composite_key] = []
-                if alert_text not in alerts_by_composite_key[composite_key]: alerts_by_composite_key[composite_key].append(alert_text)
+            r_name, r_type = route_info.get('route_short_name'), route_info.get('route_type')
+            if r_name and r_type:
+                key = f"{r_name}-{r_type}"
+                if key not in alerts_by_composite_key: alerts_by_composite_key[key] = []
+                if alert_text not in alerts_by_composite_key[key]: alerts_by_composite_key[key].append(alert_text)
     for entity in alerts_feed_cache.entity:
         if entity.HasField('alert'):
-            alert = entity.alert
-            alert_text = "Няма подробно описание."
+            alert = entity.alert; alert_text = "Няма подробно описание."
             if alert.HasField('description_text') and alert.description_text.translation:
-                soup = BeautifulSoup(alert.description_text.translation[0].text, "html.parser")
-                alert_text = soup.get_text(separator='\n').strip()
+                alert_text = BeautifulSoup(alert.description_text.translation[0].text, "html.parser").get_text(separator='\n').strip()
             if alert_text:
-                matches = re.findall(r"(трамвайн\w+|автобусн\w+|тролейбусн\w+)\s+(?:линия|линии)\s+№\s+([\d\s,и]+)", alert_text, re.IGNORECASE)
-                type_map = {'0':'трамвайн', '3':'автобусн', '11':'тролейбусн'}
-                for v_type_str, names_str in matches:
-                    for code, prefix in type_map.items():
-                        if v_type_str.lower().startswith(prefix):
-                            for name in set(n for n in re.split(r'[\s,и]+', names_str) if n):
+                for v_type, names in re.findall(r"(трамвайн\w+|автобусн\w+|тролейбусн\w+)\s+.*?№\s+([\d\s,и]+)", alert_text, re.I):
+                    for code, prefix in {'0':'трамвайн', '3':'автобусн', '11':'тролейбусн'}.items():
+                        if v_type.lower().startswith(prefix):
+                            for name in set(n for n in re.split(r'[\s,и]+', names) if n):
                                 for r_info in routes_by_short_name.get(name, []):
                                     if r_info.get('route_type') == code: add_alert_to_route(r_info, alert_text)
                             break
-            for informed_entity in alert.informed_entity:
-                if informed_entity.HasField('route_id'): add_alert_to_route(routes_data.get(informed_entity.route_id), alert_text)
-                elif informed_entity.HasField('trip') and informed_entity.trip.HasField('trip_id'):
-                    trip_info = trips_data.get(informed_entity.trip.trip_id)
+            for ie in alert.informed_entity:
+                if ie.HasField('route_id'): add_alert_to_route(routes_data.get(ie.route_id), alert_text)
+                elif ie.HasField('trip') and ie.trip.HasField('trip_id'):
+                    trip_info = trips_data.get(ie.trip.trip_id)
                     if trip_info and 'route_id' in trip_info: add_alert_to_route(routes_data.get(trip_info['route_id']), alert_text)
-                elif informed_entity.HasField('stop_id'):
-                    for t_id in stop_to_trips_map.get(informed_entity.stop_id, []):
+                elif ie.HasField('stop_id'):
+                    for t_id in stop_to_trips_map.get(ie.stop_id, []):
                         if t_id in trips_data and 'route_id' in trips_data[t_id]: add_alert_to_route(routes_data.get(trips_data[t_id]['route_id']), alert_text)
     return alerts_by_composite_key
 
@@ -171,12 +137,13 @@ def load_static_data():
                 try:
                     t_id, s_id = r['trip_id'], r['stop_id']
                     used_stop_ids.add(s_id)
+                    s_seq = int(r['stop_sequence'])
                     if t_id not in schedule_by_trip: schedule_by_trip[t_id] = {}
                     schedule_by_trip[t_id][s_id] = r['arrival_time']
                     if t_id not in trip_stops_sequence: trip_stops_sequence[t_id] = []
-                    trip_stops_sequence[t_id].append({'stop_id': s_id, 'stop_sequence': int(r['stop_sequence'])})
+                    trip_stops_sequence[t_id].append({'stop_id': s_id, 'stop_sequence': s_seq})
                     if t_id not in trip_stop_sequences_map: trip_stop_sequences_map[t_id] = {}
-                    trip_stop_sequences_map[t_id][s_id] = int(r['stop_sequence'])
+                    trip_stop_sequences_map[t_id][s_id] = s_seq
                     if s_id not in stop_to_trips_map: stop_to_trips_map[s_id] = []
                     stop_to_trips_map[s_id].append(t_id)
                     trip_info = trips_data.get(t_id)
@@ -205,17 +172,16 @@ def load_static_data():
                 elif r['exception_type'] == '2': active_services.discard(r['service_id'])
         for r in calendar_dates_rows:
             (holiday_schedule_ids if datetime.strptime(r['date'], '%Y%m%d').weekday() >= 5 else weekday_schedule_ids).add(str(r['service_id']))
-        print(f"Заредени са {len(active_services)} активни услуги. {len(weekday_schedule_ids)} делнични и {len(holiday_schedule_ids)} празнични.", file=sys.stderr)
+        print(f"Заредени са {len(active_services)} активни услуги.", file=sys.stderr)
     except FileNotFoundError as e:
         print(f"КРИТИЧНА ГРЕШКА: Файлът {e.filename} не е намерен.", file=sys.stderr)
         raise
-    return True
 
-def parse_gtfs_time(time_str: str, service_date: datetime, tz: pytz.timezone):
+def parse_gtfs_time(time_str, service_date, tz):
     try:
         h, m, s = map(int, time_str.split(':'))
         return tz.localize(datetime(service_date.year, service_date.month, service_date.day) + timedelta(hours=h, minutes=m, seconds=s))
-    except (ValueError, IndexError, TypeError): return None
+    except: return None
 
 def _build_precomputed_route_details():
     global precomputed_route_details_cache
@@ -224,28 +190,19 @@ def _build_precomputed_route_details():
         if not s_id: continue
         shape_points = get_shape_by_id(s_id)
         if not shape_points or t_id not in trip_stops_sequence: continue
-        stops_list = []
-        for s in trip_stops_sequence.get(t_id, []):
-            stop_data = stops_data.get(s['stop_id'])
-            if stop_data:
-                s_copy = stop_data.copy()
-                s_copy['stop_sequence'], s_copy['service_types'] = s['stop_sequence'], sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))
-                stops_list.append(s_copy)
+        stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence'], 'service_types': sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))}) for s in trip_stops_sequence.get(t_id, []) if stops_data.get(s['stop_id'])]
         if stops_list: precomputed_route_details_cache[t_id] = {"shape": shape_points, "stops": stops_list}
 
 def _build_routes_by_line():
     global routes_by_line_cache
     lines_to_trips = {}
     for t_id, t_info in trips_data.items():
-        r_id = t_info.get('route_id')
-        if not r_id: continue
-        route_info = routes_data.get(r_id)
-        if not route_info: continue
-        line_num, r_type = route_info.get('route_short_name'), route_info.get('route_type')
-        if not line_num or not r_type: continue
-        line_key = (line_num, r_type)
-        if line_key not in lines_to_trips: lines_to_trips[line_key] = []
-        lines_to_trips[line_key].append(t_id)
+        route_info = routes_data.get(t_info.get('route_id'))
+        if route_info:
+            line_key = (route_info.get('route_short_name'), route_info.get('route_type'))
+            if all(line_key):
+                if line_key not in lines_to_trips: lines_to_trips[line_key] = []
+                lines_to_trips[line_key].append(t_id)
     for (line_num, r_type), t_ids in lines_to_trips.items():
         headsigns = Counter(trips_data[t_id].get('trip_headsign') for t_id in t_ids if t_id in trips_data)
         main_headsigns = {h for h, c in headsigns.most_common(2)}
@@ -257,13 +214,7 @@ def _build_routes_by_line():
             if not s_id or s_id in processed_shapes: continue
             shape_points = get_shape_by_id(s_id)
             if not shape_points: continue
-            stops_list = []
-            for s in trip_stops_sequence.get(t_id,[]):
-                stop_data = stops_data.get(s['stop_id'])
-                if stop_data:
-                    s_copy = stop_data.copy()
-                    s_copy['stop_sequence'], s_copy['service_types'] = s['stop_sequence'], sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))
-                    stops_list.append(s_copy)
+            stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence'], 'service_types': sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))}) for s in trip_stops_sequence.get(t_id,[]) if stops_data.get(s['stop_id'])]
             if not stops_list: continue
             variation_data = {"direction":t_info.get('trip_headsign','Н/И'), "trip_id_sample":t_id, "shape":shape_points, "stops":stops_list}
             if line_num not in routes_by_line_cache: routes_by_line_cache[line_num] = {}
@@ -271,35 +222,36 @@ def _build_routes_by_line():
             routes_by_line_cache[line_num][r_type].append(variation_data)
             processed_shapes.add(s_id)
 
-def ensure_caches_are_built():
-    global precomputed_route_details_cache, routes_by_line_cache
-    if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
-        return
-    with initialization_lock:
-        if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
-            return
-        print("--- [Lazy Init] Първа заявка. Започва изграждане на тежките кешове...")
-        start_time = time.time()
-        precomputed_route_details_cache, routes_by_line_cache = {}, {}
-        _build_precomputed_route_details()
-        _build_routes_by_line()
-        end_time = time.time()
-        print(f"--- [Lazy Init] Тежките кешове са изградени за {end_time - start_time:.2f} секунди.")
+def ensure_route_details_cache():
+    if precomputed_route_details_cache is None:
+        with initialization_lock:
+            if precomputed_route_details_cache is None:
+                print("--- [Lazy Init] Изграждане на precomputed_route_details_cache...")
+                start_time = time.time()
+                global precomputed_route_details_cache
+                precomputed_route_details_cache = {}
+                _build_precomputed_route_details()
+                print(f"--- [Lazy Init] precomputed_route_details_cache е готов за {time.time() - start_time:.2f} сек.")
+
+def ensure_routes_by_line_cache():
+    if routes_by_line_cache is None:
+        with initialization_lock:
+            if routes_by_line_cache is None:
+                print("--- [Lazy Init] Изграждане на routes_by_line_cache...")
+                start_time = time.time()
+                global routes_by_line_cache
+                routes_by_line_cache = {}
+                _build_routes_by_line()
+                print(f"--- [Lazy Init] routes_by_line_cache е готов за {time.time() - start_time:.2f} сек.")
 
 # ----------------- СТАРТИРАНЕ НА СЪРВЪРА (Бърза версия) -----------------
 print("--- Сървърът стартира. Зареждане на основни статични данни...")
 load_static_data()
 print("--- Основните данни са заредени. Първоначално зареждане на данни в реално време...")
 refresh_realtime_cache_if_needed()
-print("--- Сървърът е готов за приемане на заявки. Тежките кешове ще се изградят при първа заявка. ---")
+print("--- Сървърът е готов. Тежките кешове ще се изградят при първа нужда. ---")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
-@app.before_request
-def before_request_func():
-    if 'debug' in request.path:
-        return
-    ensure_caches_are_built()
-
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
     try:
@@ -521,13 +473,7 @@ def get_shape_for_trip(trip_id):
 @app.route('/api/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
     if trip_id not in trip_stops_sequence: return jsonify({"error": "Trip not found"}), 404
-    stops_list = []
-    for s in trip_stops_sequence.get(trip_id, []):
-        stop_data = stops_data.get(s['stop_id'])
-        if stop_data:
-            s_copy = stop_data.copy()
-            s_copy['stop_sequence'] = s['stop_sequence']
-            stops_list.append(s_copy)
+    stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence']}) for s in trip_stops_sequence.get(trip_id, []) if stops_data.get(s['stop_id'])]
     return jsonify(stops_list)
 
 @app.route('/api/all_routes')
@@ -546,28 +492,19 @@ def get_all_stops():
 
 @app.route('/api/all_lines_structured')
 def get_all_lines_structured():
+    ensure_routes_by_line_cache()
     try:
-        structured_lines = {}
-        for t_id, t_info in trips_data.items():
-            r_id = t_info.get('route_id')
-            if not r_id: continue
-            if r_id not in structured_lines:
-                r_info = routes_data.get(r_id)
-                if not r_info: continue
-                r_name, r_type = r_info.get('route_short_name', 'Н/А'), r_info.get('route_type', '3')
+        final_list = []
+        for line_num, types in routes_by_line_cache.items():
+            for r_type, variations in types.items():
                 transport_type = 'BUS'
-                if r_name.startswith('N'): transport_type = 'NIGHT'
+                if line_num.startswith('N'): transport_type = 'NIGHT'
                 elif r_type == '0': transport_type = 'TRAM'
                 elif r_type == '11': transport_type = 'TROLLEY'
                 elif r_type in ['1','2']: transport_type = 'METRO'
-                structured_lines[r_id] = {"line_name": r_name, "transport_type": transport_type, "directions": {}}
-        for t_id, t_info in trips_data.items():
-            r_id = t_info.get('route_id')
-            if r_id in structured_lines:
-                dir_id = t_info.get('direction_id', '0')
-                if dir_id not in structured_lines[r_id]["directions"]:
-                    structured_lines[r_id]["directions"][dir_id] = {"headsign": t_info.get('trip_headsign', 'Н/И'), "example_trip_id": t_id}
-        final_list = [dict(line_data, directions=list(line_data["directions"].values())) for line_data in structured_lines.values()]
+                
+                directions = [{"headsign": v['direction'], "example_trip_id": v['trip_id_sample']} for v in variations]
+                final_list.append({"line_name": line_num, "transport_type": transport_type, "directions": directions})
         return jsonify(final_list)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_all_lines_structured: {e}", file=sys.stderr)
@@ -575,10 +512,15 @@ def get_all_lines_structured():
 
 @app.route('/api/line_details/<line_number>/<route_type_code>')
 def get_line_details(line_number, route_type_code):
-    return jsonify(routes_by_line_cache.get(line_number, {}).get(route_type_code, []))
+    ensure_routes_by_line_cache()
+    line_data = routes_by_line_cache.get(line_number, {}).get(route_type_code, [])
+    if not line_data:
+        return jsonify({"error": f"Няма данни за линия {line_number}."}), 404
+    return jsonify(line_data)
 
 @app.route('/api/full_route_view/<trip_id>')
 def get_full_route_view(trip_id):
+    ensure_route_details_cache()
     try:
         cached_data = precomputed_route_details_cache.get(trip_id)
         if not cached_data: return jsonify({"error": f"Static route details not found for trip {trip_id}."}), 404
@@ -605,6 +547,7 @@ def get_full_route_view(trip_id):
 
 @app.route('/api/static_route_view/<trip_id>')
 def get_static_route_view(trip_id):
+    ensure_route_details_cache()
     cached_data = precomputed_route_details_cache.get(trip_id)
     if not cached_data: return jsonify({"error": f"Static route details not found for trip {trip_id}."}), 404
     return jsonify({"shape": cached_data.get("shape", []), "stops": cached_data.get("stops", [])})
