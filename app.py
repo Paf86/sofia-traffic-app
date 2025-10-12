@@ -18,7 +18,7 @@ from collections import Counter
 app = Flask(__name__)
 CORS(app)
 
-# Динамично намира пътя до текущата директория, за да работи навсякъде
+# Динамично намира пътя до текущата директория, за да работи навсякъде (на твоя компютър, на Render и т.н.).
 BASE_PATH = os.path.dirname(os.path.abspath(__file__)) + "/"
 
 # --- Секция за кеширане ---
@@ -230,14 +230,14 @@ def load_static_data():
 
         for row in calendar_dates_rows:
             if row['date'] == today_str:
-                if row['exception_type'] == '1': # Holiday service today
+                if row['exception_type'] == '1':
                     active_services.add(row['service_id'])
-                elif row['exception_type'] == '2': # Service removed for today
+                elif row['exception_type'] == '2':
                     active_services.discard(row['service_id'])
 
         for row in calendar_dates_rows:
             date_obj = datetime.strptime(row['date'], '%Y%m%d')
-            if date_obj.weekday() >= 5: # Saturday or Sunday
+            if date_obj.weekday() >= 5:
                 holiday_schedule_ids.add(str(row['service_id']))
             else:
                 weekday_schedule_ids.add(str(row['service_id']))
@@ -617,8 +617,9 @@ def get_schedule_for_stop(stop_code):
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_schedule_for_stop: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
-        
-# Всички останали ендпойнти, които вече имаш, остават същите
+
+# ---- Останалите ендпойнти ----
+
 @app.route('/api/vehicles_for_routes/<route_names_str>')
 def get_vehicles_for_routes(route_names_str):
     try:
@@ -717,6 +718,63 @@ def get_all_lines_structured():
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_all_lines_structured: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
+        
+@app.route('/api/line_details/<line_number>/<route_type_code>')
+def get_line_details(line_number, route_type_code):
+    line_data = routes_by_line_cache.get(line_number, {}).get(route_type_code)
+    if not line_data:
+        return jsonify({"error": f"Няма данни за линия номер {line_number} от тип {route_type_code}."}), 404
+    return jsonify(line_data)
+
+@app.route('/api/full_route_view/<trip_id>')
+def get_full_route_view(trip_id):
+    try:
+        cached_data = precomputed_route_details_cache.get(trip_id)
+        if not cached_data:
+            return jsonify({"error": f"Static route details for trip {trip_id} not found in cache."}), 404
+        trip_info = trips_data.get(trip_id)
+        if not trip_info:
+             return jsonify({"error": f"Trip info for {trip_id} not found."}), 404
+        route_info = routes_data.get(trip_info.get('route_id'))
+        if not route_info:
+            return jsonify({"error": f"Route info for trip {trip_id} not found."}), 404
+        route_name_to_fetch = route_info.get('route_short_name')
+        refresh_realtime_cache_if_needed()
+        live_vehicles = []
+        if vehicle_positions_feed_cache:
+            for entity in vehicle_positions_feed_cache.entity:
+                if entity.HasField('vehicle'):
+                    vehicle = entity.vehicle
+                    v_trip_id = vehicle.trip.trip_id
+                    v_trip_info = trips_data.get(v_trip_id)
+                    if not v_trip_info: continue
+                    v_route_info = routes_data.get(v_trip_info.get('route_id'))
+                    if v_route_info and v_route_info.get('route_short_name') == route_name_to_fetch:
+                        live_vehicles.append({
+                            "latitude": vehicle.position.latitude if vehicle.HasField('position') else 0,
+                            "longitude": vehicle.position.longitude if vehicle.HasField('position') else 0,
+                            "trip_id": v_trip_id,
+                            "route_name": v_route_info.get('route_short_name'),
+                            "route_type": v_route_info.get('route_type', ''),
+                            "destination": v_trip_info.get('trip_headsign', 'Н/И')
+                        })
+        full_response = {
+            "shape": cached_data["shape"],
+            "stops": cached_data["stops"],
+            "vehicles": live_vehicles
+        }
+        return jsonify(full_response)
+    except Exception as e:
+        print(f"КРИТИЧНА ГРЕШКА в get_full_route_view: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({"error": "An internal server error occurred."}), 500
+
+@app.route('/api/static_route_view/<trip_id>')
+def get_static_route_view(trip_id):
+    cached_data = precomputed_route_details_cache.get(trip_id)
+    if not cached_data:
+        return jsonify({"error": f"Static route details for trip {trip_id} not found in cache."}), 404
+    return jsonify({"shape": cached_data.get("shape", []),"stops": cached_data.get("stops", [])})
 
 @app.route('/api/debug/alerts_raw')
 def debug_alerts_raw():
