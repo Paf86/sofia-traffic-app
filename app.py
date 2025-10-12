@@ -29,6 +29,7 @@ weekday_schedule_ids, holiday_schedule_ids = set(), set()
 sofia_tz = pytz.timezone('Europe/Sofia')
 precomputed_route_details_cache, routes_by_line_cache = None, None
 initialization_lock = threading.Lock()
+shapes_data_cache, shapes_data_lock = {}, threading.Lock()
 ARRIVAL_ZONE_METERS, DEPARTURE_ZONE_METERS, HYBRID_TRIGGER_ZONE_METERS = 50, 70, 20
 AVG_SPEED_MPS = {'0': 6.9, '3': 5.5, '11': 6.0, 'DEFAULT': 5.5}
 
@@ -62,19 +63,22 @@ def refresh_realtime_cache_if_needed():
             except requests.RequestException as e: print(f"КРИТИЧНА ГРЕШКА при мрежова заявка: {e}", file=sys.stderr)
 
 def get_shape_by_id(shape_id):
-    # Тази функция вече не кешира в паметта, а чете файла всеки път.
-    # Това е по-бавно, но драстично намалява използването на RAM.
-    shape_points = []
-    try:
-        with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['shape_id'] == shape_id:
-                    shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
-        return shape_points
-    except Exception as e:
-        print(f"Грешка при четене на shapes.txt: {e}", file=sys.stderr)
-        return []
+    if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
+    with shapes_data_lock:
+        if shape_id in shapes_data_cache: return shapes_data_cache[shape_id]
+        print(f"--- [Lazy Load] Зареждане на shape '{shape_id}'...", file=sys.stderr)
+        shape_points = []
+        try:
+            with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['shape_id'] == shape_id:
+                        shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
+            if shape_points: shapes_data_cache[shape_id] = shape_points
+            return shape_points
+        except Exception as e:
+            print(f"Грешка при четене на shapes.txt: {e}", file=sys.stderr)
+            return []
 
 def get_processed_alerts():
     if not alerts_feed_cache: return {}
@@ -214,21 +218,23 @@ def _build_routes_by_line():
             processed_shapes.add(s_id)
 
 def ensure_caches_are_built():
+    global precomputed_route_details_cache, routes_by_line_cache
     if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
         return
     with initialization_lock:
         if precomputed_route_details_cache is not None and routes_by_line_cache is not None:
             return
+        
         print("--- [Lazy Init] Първа заявка. Започва изграждане на тежките кешове...")
         start_time = time.time()
-        # Извикваме двете функции, които вече имат global декларации в тях
-        global precomputed_route_details_cache
-        precomputed_route_details_cache = {}
-        _build_precomputed_route_details()
         
-        global routes_by_line_cache
+        # Правим ги празни речници, преди да ги подадем на функциите
+        precomputed_route_details_cache = {}
         routes_by_line_cache = {}
+
+        _build_precomputed_route_details()
         _build_routes_by_line()
+        
         end_time = time.time()
         print(f"--- [Lazy Init] Тежките кешове са изградени за {end_time - start_time:.2f} секунди.")
 
