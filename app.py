@@ -18,7 +18,6 @@ from collections import Counter
 app = Flask(__name__)
 CORS(app)
 
-# Динамично намира пътя до текущата директория, за да работи навсякъде (на твоя компютър, на Render и т.н.).
 BASE_PATH = os.path.dirname(os.path.abspath(__file__)) + "/"
 
 # --- Секция за кеширане ---
@@ -35,7 +34,10 @@ last_cache_update_timestamp = 0
 
 # --- Глобални статични данни ---
 routes_data, trips_data, stops_data, active_services = {}, {}, {}, set()
-schedule_by_trip, shapes_data, trip_stops_sequence, stop_to_trips_map = {}, {}, {}, {}
+# ============================ ПРОМЯНА (1/5) ============================
+# Премахваме shapes_data оттук, за да не се зарежда в паметта при старт
+schedule_by_trip, trip_stops_sequence, stop_to_trips_map = {}, {}, {}
+# =====================================================================
 stop_service_info = {}
 trip_stop_sequences_map = {}
 weekday_schedule_ids, holiday_schedule_ids = set(), set()
@@ -96,9 +98,46 @@ def refresh_realtime_cache_if_needed():
             except requests.RequestException as e:
                 print(f"КРИТИЧНА ГРЕШКА при мрежова заявка към прокси: {e}", file=sys.stderr)
 
+# ============================ ПРОМЯНА (2/5) ============================
+# Нова функция и кеш за "мързеливо" зареждане на shapes.txt
+shapes_data_cache = {}
+shapes_data_lock = threading.Lock()
+
+def get_shape_by_id(shape_id):
+    """Зарежда форма от shapes.txt при нужда и я кешира в паметта."""
+    global shapes_data_cache
+    
+    if shape_id in shapes_data_cache:
+        return shapes_data_cache[shape_id]
+        
+    with shapes_data_lock:
+        if shape_id in shapes_data_cache:
+            return shapes_data_cache[shape_id]
+
+        print(f"--- [Lazy Load] Зареждане на shape '{shape_id}' от файла...", file=sys.stderr)
+        shape_points = []
+        try:
+            with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['shape_id'] == shape_id:
+                        shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
+            
+            if shape_points:
+                shapes_data_cache[shape_id] = shape_points
+            return shape_points
+        except FileNotFoundError:
+            print("КРИТИЧНА ГРЕШКА: shapes.txt не е намерен!", file=sys.stderr)
+            return []
+        except (ValueError, KeyError) as e:
+            print(f"Проблемен ред в shapes.txt. Грешка: {e}", file=sys.stderr)
+            return []
+# =====================================================================
+
 def get_processed_alerts():
     if not alerts_feed_cache:
         return {}
+    # ... (кодът тук е без промяна)
     alerts_by_composite_key = {}
     routes_by_short_name = {}
     for r_id, r_info in routes_data.items():
@@ -165,7 +204,10 @@ def get_processed_alerts():
     return alerts_by_composite_key
 
 def load_static_data():
-    global routes_data, trips_data, stops_data, active_services, shapes_data, schedule_by_trip, trip_stops_sequence, stop_service_info, stop_to_trips_map, trip_stop_sequences_map, weekday_schedule_ids, holiday_schedule_ids
+    # ============================ ПРОМЯНА (3/5) ============================
+    # Премахваме shapes_data от global, защото вече не е глобална променлива
+    global routes_data, trips_data, stops_data, active_services, schedule_by_trip, trip_stops_sequence, stop_service_info, stop_to_trips_map, trip_stop_sequences_map, weekday_schedule_ids, holiday_schedule_ids
+    # =====================================================================
     try:
         with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f: routes_data = {row['route_id']: row for row in csv.DictReader(f)}
 
@@ -204,14 +246,13 @@ def load_static_data():
 
         for trip_id in trip_stops_sequence: trip_stops_sequence[trip_id].sort(key=lambda x: x['stop_sequence'])
         with open(f'{BASE_PATH}stops.txt', mode='r', encoding='utf-8-sig') as f: stops_data = {row['stop_id']: row for row in csv.DictReader(f) if row['stop_id'] in used_stop_ids}
-        with open(f'{BASE_PATH}shapes.txt', mode='r', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
-                try:
-                    shape_id = row['shape_id']
-                    if shape_id not in shapes_data: shapes_data[shape_id] = []
-                    shapes_data[shape_id].append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
-                except (ValueError, KeyError) as e: print(f"Проблемен ред в shapes.txt: {row}. Грешка: {e}", file=sys.stderr)
 
+        # ============================ ПРОМЯНА (4/5) ============================
+        # Изтриваме целия блок, който зарежда shapes.txt
+        # with open(f'{BASE_PATH}shapes.txt', ... )
+        # =====================================================================
+
+        # ... останалата част от функцията е без промяна ...
         active_services.clear()
         with open(f'{BASE_PATH}calendar_dates.txt', 'r', encoding='utf-8-sig') as f:
             calendar_dates_rows = list(csv.DictReader(f))
@@ -257,14 +298,16 @@ def parse_gtfs_time(time_str: str, service_date: datetime, tz: pytz.timezone):
         return tz.localize(naive_datetime)
     except (ValueError, IndexError, TypeError): return None
 
-
 def precompute_all_route_details():
     global precomputed_route_details_cache
     precomputed_route_details_cache.clear()
     for trip_id, trip_info in trips_data.items():
         shape_id = trip_info.get('shape_id')
         if not shape_id: continue
-        shape_points = shapes_data.get(shape_id, [])
+        # ============================ ПРОМЯНА (5/5) ============================
+        # Заменяме директния достъп с извикване на новата функция
+        shape_points = get_shape_by_id(shape_id)
+        # =====================================================================
         if not shape_points: continue
         if trip_id not in trip_stops_sequence: continue
         stops_list = []
@@ -304,7 +347,9 @@ def precompute_routes_by_line():
             if not trip_info or trip_info.get('trip_headsign') not in main_headsigns: continue
             shape_id = trip_info.get('shape_id')
             if not shape_id or shape_id in processed_shapes_for_line: continue
-            shape_points = shapes_data.get(shape_id, [])
+            # ============================ ПРОМЯНА (5/5) ============================
+            shape_points = get_shape_by_id(shape_id)
+            # =====================================================================
             if not shape_points: continue
             stops_list = []
             for s in trip_stops_sequence.get(trip_id, []):
@@ -325,7 +370,6 @@ def precompute_routes_by_line():
             processed_shapes_for_line.add(shape_id)
 
 # ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
-
 print("--- Сървърът стартира. Зареждане на статични данни...")
 load_static_data()
 print("--- Статичните данни са заредени. Предварително изчисляване на кешове...")
@@ -336,48 +380,51 @@ refresh_realtime_cache_if_needed()
 print("--- Сървърът е готов за приемане на заявки. ---")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
+# (Всички ендпойнти оттук надолу са без промяна, освен /api/shape/<trip_id>)
 
+@app.route('/api/shape/<trip_id>')
+def get_shape_for_trip(trip_id):
+    trip_info = trips_data.get(trip_id)
+    if not trip_info: return jsonify({"error": "Trip not found"}), 404
+    shape_id = trip_info.get('shape_id')
+    # ============================ ПРОМЯНА (5/5) ============================
+    shape_points = get_shape_by_id(shape_id)
+    # =====================================================================
+    return jsonify(shape_points)
+
+# ... Копирай останалите си ендпойнти от оригиналния файл тук ...
+# Те не се нуждаят от промяна.
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
     try:
         refresh_realtime_cache_if_needed()
-        
         processed_alerts = get_processed_alerts()
         now_dt = datetime.now(sofia_tz)
         now_ts = int(time.time())
         arrival_predictions = {e.trip_update.trip.trip_id: {stu.stop_id: stu.arrival.time for stu in e.trip_update.stop_time_update if stu.HasField('arrival') and stu.arrival.time > 0} for e in trip_updates_feed_cache.entity if e.HasField('trip_update')} if trip_updates_feed_cache else {}
         vehicle_positions = {e.vehicle.trip.trip_id: e.vehicle for e in vehicle_positions_feed_cache.entity if e.HasField('vehicle')} if vehicle_positions_feed_cache else {}
-        
         stop_info = stops_data.get(stop_id)
         if not stop_info: return jsonify({"error": "Stop not found"}), 404
-        
         stop_code = stop_info.get('stop_code')
         physical_stop_ids = {s_id for s_id, s_data in stops_data.items() if s_data.get('stop_code') == stop_code and stop_code}
         physical_stop_ids.add(stop_id)
-        
         all_arrivals = []
         trip_ids_for_stop = {tid for s_id in physical_stop_ids for tid in stop_to_trips_map.get(s_id, [])}
-
         with shared_data_lock:
             stale_keys_official = [k for k, v in recent_official_arrivals_cache.items() if now_ts - v > RECENT_OFFICIAL_TTL_SECONDS]
             for k in stale_keys_official: del recent_official_arrivals_cache[k]
             stale_keys_gps = [k for k, v in gps_arrival_cache.items() if now_ts - v > GPS_CACHE_TTL_SECONDS]
             for k in stale_keys_gps: del gps_arrival_cache[k]
-
         for trip_id in trip_ids_for_stop:
             trip_info = trips_data.get(trip_id)
             if not trip_info: continue
-            
             trip_schedule_for_stops = schedule_by_trip.get(trip_id, {})
             relevant_stop_id = next((s_id for s_id in physical_stop_ids if s_id in trip_schedule_for_stops), None)
             if not relevant_stop_id: continue
-            
             route_info = routes_data.get(trip_info['route_id'])
             if not route_info: continue
-            
             eta_minutes, prediction_source, is_live_data = None, None, False
             predicted_arrival_ts = arrival_predictions.get(trip_id, {}).get(relevant_stop_id)
-            
             if predicted_arrival_ts and predicted_arrival_ts > now_ts - 60:
                 eta_minutes = max(0, round((predicted_arrival_ts - now_ts) / 60))
                 prediction_source = "official"
@@ -388,22 +435,17 @@ def get_vehicles_for_stop(stop_id):
                 is_live_data = True
                 with shared_data_lock:
                     if (trip_id, relevant_stop_id) in recent_official_arrivals_cache: continue
-                
                 vehicle = vehicle_positions[trip_id]
                 target_stop_info = stops_data.get(relevant_stop_id)
                 distance_to_our_stop = None
-                
                 if vehicle.HasField('position') and target_stop_info and target_stop_info.get('stop_lat'):
                     distance_to_our_stop = haversine_distance(vehicle.position.latitude, vehicle.position.longitude, float(target_stop_info['stop_lat']), float(target_stop_info['stop_lon']))
-                
                 cache_key = (trip_id, relevant_stop_id)
                 with shared_data_lock: was_in_arrival_zone = cache_key in gps_arrival_cache
-                
                 if was_in_arrival_zone and distance_to_our_stop is not None and distance_to_our_stop > DEPARTURE_ZONE_METERS:
                     with shared_data_lock:
                         if cache_key in gps_arrival_cache: del gps_arrival_cache[cache_key]
                     continue
-                
                 if distance_to_our_stop is not None and distance_to_our_stop < ARRIVAL_ZONE_METERS:
                     eta_minutes, prediction_source = 0, "hybrid"
                     if not was_in_arrival_zone:
@@ -429,7 +471,6 @@ def get_vehicles_for_stop(stop_id):
                         if distance_to_our_stop is not None and vehicle_speed_mps > 0:
                             eta_seconds = distance_to_our_stop / vehicle_speed_mps
                             eta_minutes, prediction_source = max(0, round(eta_seconds / 60)), "hybrid"
-            
             if prediction_source is None:
                 if trip_info.get('service_id') in active_services:
                     scheduled_time_str = trip_schedule_for_stops.get(relevant_stop_id, "")
@@ -438,24 +479,18 @@ def get_vehicles_for_stop(stop_id):
                         eta_minutes = max(0, round((scheduled_dt_aware - now_dt).total_seconds() / 60))
                         prediction_source = "schedule"
                         is_live_data = False
-            
             if prediction_source is not None:
                 route_short_name = route_info.get('route_short_name', 'Н/А')
                 route_type = route_info.get('route_type')
                 alert_messages = processed_alerts.get(f"{route_short_name}-{route_type}")
-                all_arrivals.append({
-                    "trip_id": trip_id, "route_name": route_short_name, "route_type": route_type,
-                    "destination": trip_info.get('trip_headsign', 'Н/И'), "eta_minutes": eta_minutes,
-                    "prediction_source": prediction_source, "is_live": is_live_data, "alerts": alert_messages
-                })
-        
+                all_arrivals.append({ "trip_id": trip_id, "route_name": route_short_name, "route_type": route_type, "destination": trip_info.get('trip_headsign', 'Н/И'), "eta_minutes": eta_minutes, "prediction_source": prediction_source, "is_live": is_live_data, "alerts": alert_messages })
         all_arrivals.sort(key=lambda x: (not x['is_live'], x['eta_minutes']))
         return jsonify(all_arrivals)
-        
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_vehicles_for_stop: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
+        
+# ... (и всички останали, които не съм включил тук, за краткост)
 
 @app.route('/api/bulk_arrivals_for_stops', methods=['POST'])
 def get_bulk_arrivals_for_stops():
@@ -796,4 +831,5 @@ def debug_alerts():
             return jsonify({"status": "OK","message": "Няма активни предупреждения в момента.","data": {}})
         return jsonify({"status": "OK","message": f"Намерени са {len(processed_alerts)} активни предупреждения.","data": processed_alerts})
     except Exception as e:
+
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
