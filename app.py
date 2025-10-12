@@ -18,7 +18,6 @@ from collections import Counter
 app = Flask(__name__)
 CORS(app)
 
-# Динамично намира пътя до текущата директория
 BASE_PATH = os.path.dirname(os.path.abspath(__file__)) + "/"
 
 # --- Секция за кеширане ---
@@ -32,6 +31,7 @@ trip_updates_feed_cache = None
 vehicle_positions_feed_cache = None
 alerts_feed_cache = None
 last_cache_update_timestamp = 0
+is_data_loaded = False # <-- НОВ ФЛАГ ЗА ГОТОВНОСТ
 
 # --- Глобални статични данни ---
 routes_data, trips_data, stops_data, active_services = {}, {}, {}, set()
@@ -50,7 +50,6 @@ ARRIVAL_ZONE_METERS = 50
 DEPARTURE_ZONE_METERS = 70
 HYBRID_TRIGGER_ZONE_METERS = 20
 AVG_SPEED_MPS = {'0': 6.9, '3': 5.5, '11': 6.0, 'DEFAULT': 5.5}
-
 
 # --- ХЕЛПЕР ФУНКЦИИ ---
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -101,7 +100,6 @@ shapes_data_cache = {}
 shapes_data_lock = threading.Lock()
 
 def get_shape_by_id(shape_id):
-    """Зарежда форма от shapes.txt при нужда и я кешира в паметта."""
     global shapes_data_cache
     if shape_id in shapes_data_cache:
         return shapes_data_cache[shape_id]
@@ -293,6 +291,7 @@ def precompute_routes_by_line():
 
 # ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
 def initialize_app():
+    global is_data_loaded
     print("--- [BG Thread] Фоновото инициализиране започва...")
     print("--- [BG Thread] Зареждане на статични данни...")
     load_static_data()
@@ -301,6 +300,7 @@ def initialize_app():
     precompute_routes_by_line()
     print("--- [BG Thread] Кешовете са подготвени. Първоначално зареждане на данни в реално време...")
     refresh_realtime_cache_if_needed()
+    is_data_loaded = True
     print("--- [BG Thread] Сървърът е напълно готов за работа. ---")
 
 print("--- Основният процес стартира. Подготовка на фонова нишка...")
@@ -309,6 +309,11 @@ init_thread.start()
 print("--- Сървърът е стартиран и слуша за заявки. Инициализацията продължава на заден фон...")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
+@app.before_request
+def before_request_func():
+    if not is_data_loaded:
+        return jsonify({"error": "Server is initializing, please try again in a moment."}), 503
+
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
     try:
@@ -468,7 +473,6 @@ def get_bulk_arrivals_for_stops():
         print(f"КРИТИЧНА ГРЕШКА в get_bulk_arrivals_for_stops: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
-# Всички останали ендпойнти без промяна
 @app.route('/api/schedule_for_stop/<stop_code>')
 def get_schedule_for_stop(stop_code):
     try:
@@ -488,13 +492,13 @@ def get_schedule_for_stop(stop_code):
                 if not arr_time: return
                 if r_name not in target: target[r_name] = {}
                 if dest not in target[r_name]: target[r_name][dest] = {"times": [], "route_type": r_type}
-                target[r_name][dest]["times"].append(arr_time)
+                if arr_time not in target[r_name][dest]["times"]: target[r_name][dest]["times"].append(arr_time)
             if service_id in holiday_schedule_ids: add_to_schedule(schedule["holiday"])
             elif service_id in weekday_schedule_ids: add_to_schedule(schedule["weekday"])
         for sched_type in schedule.values():
             for route in sched_type.values():
                 for dest_data in route.values():
-                    dest_data["times"] = sorted(list(set(dest_data["times"])), key=lambda t: tuple(map(int, t.split(':'))))
+                    dest_data["times"].sort(key=lambda t: tuple(map(int, t.split(':'))))
         return jsonify(schedule)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_schedule_for_stop: {e}", file=sys.stderr)
@@ -519,6 +523,14 @@ def get_vehicles_for_routes(route_names_str):
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_vehicles_for_routes: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
+
+@app.route('/api/shape/<trip_id>')
+def get_shape_for_trip(trip_id):
+    trip_info = trips_data.get(trip_id)
+    if not trip_info: return jsonify({"error": "Trip not found"}), 404
+    shape_id = trip_info.get('shape_id')
+    shape_points = get_shape_by_id(shape_id)
+    return jsonify(shape_points)
 
 @app.route('/api/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
@@ -552,26 +564,25 @@ def get_all_lines_structured():
         structured_lines = {}
         for t_id, t_info in trips_data.items():
             r_id = t_info.get('route_id')
-            if not r_id or r_id in structured_lines: continue
-            r_info = routes_data.get(r_id)
-            if not r_info: continue
-            r_name, r_type = r_info.get('route_short_name', 'Н/А'), r_info.get('route_type', '3')
-            transport_type = 'BUS'
-            if r_name.startswith('N'): transport_type = 'NIGHT'
-            elif r_type == '0': transport_type = 'TRAM'
-            elif r_type == '11': transport_type = 'TROLLEY'
-            elif r_type in ['1','2']: transport_type = 'METRO'
-            structured_lines[r_id] = {"line_name": r_name, "transport_type": transport_type, "directions": {}}
+            if not r_id: continue
+            if r_id not in structured_lines:
+                r_info = routes_data.get(r_id)
+                if not r_info: continue
+                r_name, r_type = r_info.get('route_short_name', 'Н/А'), r_info.get('route_type', '3')
+                transport_type = 'BUS'
+                if r_name.startswith('N'): transport_type = 'NIGHT'
+                elif r_type == '0': transport_type = 'TRAM'
+                elif r_type == '11': transport_type = 'TROLLEY'
+                elif r_type in ['1','2']: transport_type = 'METRO'
+                structured_lines[r_id] = {"line_name": r_name, "transport_type": transport_type, "directions": {}}
+        # Оптимизация: Втори цикъл за попълване на посоките, за да се избегнат многократни проверки
         for t_id, t_info in trips_data.items():
             r_id = t_info.get('route_id')
             if r_id in structured_lines:
                 dir_id = t_info.get('direction_id', '0')
                 if dir_id not in structured_lines[r_id]["directions"]:
                     structured_lines[r_id]["directions"][dir_id] = {"headsign": t_info.get('trip_headsign', 'Н/И'), "example_trip_id": t_id}
-        final_list = []
-        for r_id, line_data in structured_lines.items():
-            line_data["directions"] = list(line_data["directions"].values())
-            final_list.append(line_data)
+        final_list = [dict(line_data, directions=list(line_data["directions"].values())) for line_data in structured_lines.values()]
         return jsonify(final_list)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_all_lines_structured: {e}", file=sys.stderr)
@@ -631,4 +642,3 @@ def debug_alerts():
         return jsonify({"status": "OK","message": f"Намерени са {len(processed_alerts)} активни предупреждения.","data": processed_alerts})
     except Exception as e:
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
-
