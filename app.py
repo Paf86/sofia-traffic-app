@@ -18,6 +18,7 @@ from collections import Counter
 app = Flask(__name__)
 CORS(app)
 
+# Динамично намира пътя до текущата директория
 BASE_PATH = os.path.dirname(os.path.abspath(__file__)) + "/"
 
 # --- Секция за кеширане ---
@@ -34,10 +35,7 @@ last_cache_update_timestamp = 0
 
 # --- Глобални статични данни ---
 routes_data, trips_data, stops_data, active_services = {}, {}, {}, set()
-# ============================ ПРОМЯНА (1/5) ============================
-# Премахваме shapes_data оттук, за да не се зарежда в паметта при старт
 schedule_by_trip, trip_stops_sequence, stop_to_trips_map = {}, {}, {}
-# =====================================================================
 stop_service_info = {}
 trip_stop_sequences_map = {}
 weekday_schedule_ids, holiday_schedule_ids = set(), set()
@@ -52,6 +50,7 @@ ARRIVAL_ZONE_METERS = 50
 DEPARTURE_ZONE_METERS = 70
 HYBRID_TRIGGER_ZONE_METERS = 20
 AVG_SPEED_MPS = {'0': 6.9, '3': 5.5, '11': 6.0, 'DEFAULT': 5.5}
+
 
 # --- ХЕЛПЕР ФУНКЦИИ ---
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -98,22 +97,17 @@ def refresh_realtime_cache_if_needed():
             except requests.RequestException as e:
                 print(f"КРИТИЧНА ГРЕШКА при мрежова заявка към прокси: {e}", file=sys.stderr)
 
-# ============================ ПРОМЯНА (2/5) ============================
-# Нова функция и кеш за "мързеливо" зареждане на shapes.txt
 shapes_data_cache = {}
 shapes_data_lock = threading.Lock()
 
 def get_shape_by_id(shape_id):
     """Зарежда форма от shapes.txt при нужда и я кешира в паметта."""
     global shapes_data_cache
-    
     if shape_id in shapes_data_cache:
         return shapes_data_cache[shape_id]
-        
     with shapes_data_lock:
         if shape_id in shapes_data_cache:
             return shapes_data_cache[shape_id]
-
         print(f"--- [Lazy Load] Зареждане на shape '{shape_id}' от файла...", file=sys.stderr)
         shape_points = []
         try:
@@ -122,7 +116,6 @@ def get_shape_by_id(shape_id):
                 for row in reader:
                     if row['shape_id'] == shape_id:
                         shape_points.append([float(row['shape_pt_lat']), float(row['shape_pt_lon'])])
-            
             if shape_points:
                 shapes_data_cache[shape_id] = shape_points
             return shape_points
@@ -132,158 +125,107 @@ def get_shape_by_id(shape_id):
         except (ValueError, KeyError) as e:
             print(f"Проблемен ред в shapes.txt. Грешка: {e}", file=sys.stderr)
             return []
-# =====================================================================
 
 def get_processed_alerts():
-    if not alerts_feed_cache:
-        return {}
-    # ... (кодът тук е без промяна)
+    if not alerts_feed_cache: return {}
     alerts_by_composite_key = {}
     routes_by_short_name = {}
     for r_id, r_info in routes_data.items():
         name = r_info.get('route_short_name')
         if name:
-            if name not in routes_by_short_name:
-                routes_by_short_name[name] = []
+            if name not in routes_by_short_name: routes_by_short_name[name] = []
             routes_by_short_name[name].append(r_info)
-
     def add_alert_to_route(route_info, alert_text):
         if route_info:
-            route_name = route_info.get('route_short_name')
-            route_type = route_info.get('route_type')
+            route_name, route_type = route_info.get('route_short_name'), route_info.get('route_type')
             if route_name and route_type:
                 composite_key = f"{route_name}-{route_type}"
-                if composite_key not in alerts_by_composite_key:
-                    alerts_by_composite_key[composite_key] = []
-                if alert_text not in alerts_by_composite_key[composite_key]:
-                    alerts_by_composite_key[composite_key].append(alert_text)
-
+                if composite_key not in alerts_by_composite_key: alerts_by_composite_key[composite_key] = []
+                if alert_text not in alerts_by_composite_key[composite_key]: alerts_by_composite_key[composite_key].append(alert_text)
     for entity in alerts_feed_cache.entity:
         if entity.HasField('alert'):
             alert = entity.alert
+            alert_text = "Няма подробно описание."
             if alert.HasField('description_text') and alert.description_text.translation:
                 html_text = alert.description_text.translation[0].text
                 soup = BeautifulSoup(html_text, "html.parser")
                 alert_text = soup.get_text(separator='\n').strip()
-            else:
-                alert_text = "Няма подробно описание."
             if alert_text:
                 pattern = r"(трамвайн\w+|автобусн\w+|тролейбусн\w+)\s+(?:линия|линии)\s+№\s+([\d\s,и]+)"
                 matches = re.findall(pattern, alert_text, re.IGNORECASE)
-                type_map = { '0': 'трамвайн', '3': 'автобусн', '11': 'тролейбусн' }
-                for match in matches:
-                    vehicle_type_str, names_str = match
-                    vehicle_type_prefix = vehicle_type_str.lower()[:9]
-                    route_type_code = None
+                type_map = {'0':'трамвайн', '3':'автобусн', '11':'тролейбусн'}
+                for v_type_str, names_str in matches:
+                    v_type_prefix = v_type_str.lower()[:9]
                     for code, prefix in type_map.items():
-                        if vehicle_type_prefix.startswith(prefix):
-                            route_type_code = code
+                        if v_type_prefix.startswith(prefix):
+                            for name in set(n for n in re.split(r'[\s,и]+', names_str) if n):
+                                if name in routes_by_short_name:
+                                    for r_info in routes_by_short_name[name]:
+                                        if r_info.get('route_type') == code: add_alert_to_route(r_info, alert_text)
                             break
-                    if route_type_code:
-                        route_names = set(name for name in re.split(r'[\s,и]+', names_str) if name)
-                        for name in route_names:
-                            if name in routes_by_short_name:
-                                for route_info in routes_by_short_name[name]:
-                                    if route_info.get('route_type') == route_type_code:
-                                        add_alert_to_route(route_info, alert_text)
             for informed_entity in alert.informed_entity:
-                if informed_entity.HasField('route_id'):
-                    route_info = routes_data.get(informed_entity.route_id)
-                    add_alert_to_route(route_info, alert_text)
+                if informed_entity.HasField('route_id'): add_alert_to_route(routes_data.get(informed_entity.route_id), alert_text)
                 elif informed_entity.HasField('trip') and informed_entity.trip.HasField('trip_id'):
                     trip_info = trips_data.get(informed_entity.trip.trip_id)
-                    if trip_info and 'route_id' in trip_info:
-                        route_info = routes_data.get(trip_info['route_id'])
-                        add_alert_to_route(route_info, alert_text)
+                    if trip_info and 'route_id' in trip_info: add_alert_to_route(routes_data.get(trip_info['route_id']), alert_text)
                 elif informed_entity.HasField('stop_id'):
-                    trip_ids_for_stop = stop_to_trips_map.get(informed_entity.stop_id, [])
-                    route_ids_for_stop = {trips_data[t_id]['route_id'] for t_id in trip_ids_for_stop if t_id in trips_data and 'route_id' in trips_data[t_id]}
-                    for route_id in route_ids_for_stop:
-                        route_info = routes_data.get(route_id)
-                        add_alert_to_route(route_info, alert_text)
+                    trip_ids = stop_to_trips_map.get(informed_entity.stop_id, [])
+                    route_ids = {trips_data[t_id]['route_id'] for t_id in trip_ids if t_id in trips_data and 'route_id' in trips_data[t_id]}
+                    for r_id in route_ids: add_alert_to_route(routes_data.get(r_id), alert_text)
     return alerts_by_composite_key
 
 def load_static_data():
-    # ============================ ПРОМЯНА (3/5) ============================
-    # Премахваме shapes_data от global, защото вече не е глобална променлива
     global routes_data, trips_data, stops_data, active_services, schedule_by_trip, trip_stops_sequence, stop_service_info, stop_to_trips_map, trip_stop_sequences_map, weekday_schedule_ids, holiday_schedule_ids
-    # =====================================================================
     try:
-        with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f: routes_data = {row['route_id']: row for row in csv.DictReader(f)}
-
+        with open(f'{BASE_PATH}routes.txt', mode='r', encoding='utf-8-sig') as f: routes_data = {r['route_id']: r for r in csv.DictReader(f)}
         IMMUNE_TROLLEYBUS_ROUTE_IDS = {'TB10','TB9','TB32','TB1','TB3','TB6','TB7','TB4','TB8','TB2','TB27','TB30','TB21','TB40'}
-        for route_id, route_info in routes_data.items():
-            if route_info.get('route_type') == '11' and route_id not in IMMUNE_TROLLEYBUS_ROUTE_IDS:
-                route_info['route_type'] = '3'
-        
-        with open(f'{BASE_PATH}trips.txt', mode='r', encoding='utf-8-sig') as f: trips_data = {row['trip_id']: row for row in csv.DictReader(f)}
+        for r_id, r_info in routes_data.items():
+            if r_info.get('route_type') == '11' and r_id not in IMMUNE_TROLLEYBUS_ROUTE_IDS: r_info['route_type'] = '3'
+        with open(f'{BASE_PATH}trips.txt', mode='r', encoding='utf-8-sig') as f: trips_data = {r['trip_id']: r for r in csv.DictReader(f)}
         used_stop_ids = set()
         with open(f'{BASE_PATH}stop_times.txt', mode='r', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
+            for r in csv.DictReader(f):
                 try:
-                    trip_id, stop_id = row['trip_id'], row['stop_id']
-                    used_stop_ids.add(stop_id)
-                    stop_seq = int(row['stop_sequence'])
-                    if trip_id not in schedule_by_trip: schedule_by_trip[trip_id] = {}
-                    schedule_by_trip[trip_id][stop_id] = row['arrival_time']
-                    if trip_id not in trip_stops_sequence: trip_stops_sequence[trip_id] = []
-                    trip_stops_sequence[trip_id].append({'stop_id': stop_id, 'stop_sequence': stop_seq})
-                    if trip_id not in trip_stop_sequences_map: trip_stop_sequences_map[trip_id] = {}
-                    trip_stop_sequences_map[trip_id][stop_id] = stop_seq
-                    if stop_id not in stop_to_trips_map: stop_to_trips_map[stop_id] = []
-                    stop_to_trips_map[stop_id].append(trip_id)
-                    trip_info = trips_data.get(trip_id)
+                    t_id, s_id = r['trip_id'], r['stop_id']
+                    used_stop_ids.add(s_id)
+                    s_seq = int(r['stop_sequence'])
+                    if t_id not in schedule_by_trip: schedule_by_trip[t_id] = {}
+                    schedule_by_trip[t_id][s_id] = r['arrival_time']
+                    if t_id not in trip_stops_sequence: trip_stops_sequence[t_id] = []
+                    trip_stops_sequence[t_id].append({'stop_id': s_id, 'stop_sequence': s_seq})
+                    if t_id not in trip_stop_sequences_map: trip_stop_sequences_map[t_id] = {}
+                    trip_stop_sequences_map[t_id][s_id] = s_seq
+                    if s_id not in stop_to_trips_map: stop_to_trips_map[s_id] = []
+                    stop_to_trips_map[s_id].append(t_id)
+                    trip_info = trips_data.get(t_id)
                     if trip_info:
                         route_info = routes_data.get(trip_info['route_id'])
                         if route_info:
-                            if stop_id not in stop_service_info: stop_service_info[stop_id] = {'types': set()}
-                            route_type = route_info.get('route_type')
-                            type_map = {'0': 'TRAM', '3': 'BUS', '11': 'TROLLEY'}
-                            transport_type = type_map.get(route_type)
-                            if route_info.get('route_short_name', '').startswith('N'): transport_type = 'NIGHT'
-                            if transport_type: stop_service_info[stop_id]['types'].add(transport_type)
-                except (ValueError, KeyError) as e: print(f"Проблемен ред в stop_times.txt: {row}. Грешка: {e}", file=sys.stderr)
-
-        for trip_id in trip_stops_sequence: trip_stops_sequence[trip_id].sort(key=lambda x: x['stop_sequence'])
-        with open(f'{BASE_PATH}stops.txt', mode='r', encoding='utf-8-sig') as f: stops_data = {row['stop_id']: row for row in csv.DictReader(f) if row['stop_id'] in used_stop_ids}
-
-        # ============================ ПРОМЯНА (4/5) ============================
-        # Изтриваме целия блок, който зарежда shapes.txt
-        # with open(f'{BASE_PATH}shapes.txt', ... )
-        # =====================================================================
-
-        # ... останалата част от функцията е без промяна ...
+                            if s_id not in stop_service_info: stop_service_info[s_id] = {'types': set()}
+                            r_type = route_info.get('route_type')
+                            type_map = {'0':'TRAM', '3':'BUS', '11':'TROLLEY'}
+                            transport_type = type_map.get(r_type)
+                            if route_info.get('route_short_name','').startswith('N'): transport_type = 'NIGHT'
+                            if transport_type: stop_service_info[s_id]['types'].add(transport_type)
+                except (ValueError, KeyError) as e: print(f"Проблемен ред в stop_times.txt: {r}. Грешка: {e}", file=sys.stderr)
+        for t_id in trip_stops_sequence: trip_stops_sequence[t_id].sort(key=lambda x: x['stop_sequence'])
+        with open(f'{BASE_PATH}stops.txt', mode='r', encoding='utf-8-sig') as f: stops_data = {r['stop_id']: r for r in csv.DictReader(f) if r['stop_id'] in used_stop_ids}
         active_services.clear()
-        with open(f'{BASE_PATH}calendar_dates.txt', 'r', encoding='utf-8-sig') as f:
-            calendar_dates_rows = list(csv.DictReader(f))
-
+        with open(f'{BASE_PATH}calendar_dates.txt', 'r', encoding='utf-8-sig') as f: calendar_dates_rows = list(csv.DictReader(f))
         today_str = datetime.now(sofia_tz).strftime('%Y%m%d')
-        is_today_holiday = any(row['date'] == today_str and row.get('exception_type') == '1' for row in calendar_dates_rows)
-        
-        all_service_ids_from_trips = {trip['service_id'] for trip in trips_data.values()}
-        original_holiday_ids = {row['service_id'] for row in calendar_dates_rows if row.get('exception_type') == '1'}
-        original_weekday_ids = all_service_ids_from_trips - original_holiday_ids
-        
-        if is_today_holiday:
-            active_services.update(original_holiday_ids)
-        else:
-            active_services.update(original_weekday_ids)
-
-        for row in calendar_dates_rows:
-            if row['date'] == today_str:
-                if row['exception_type'] == '1':
-                    active_services.add(row['service_id'])
-                elif row['exception_type'] == '2':
-                    active_services.discard(row['service_id'])
-
-        for row in calendar_dates_rows:
-            date_obj = datetime.strptime(row['date'], '%Y%m%d')
-            if date_obj.weekday() >= 5:
-                holiday_schedule_ids.add(str(row['service_id']))
-            else:
-                weekday_schedule_ids.add(str(row['service_id']))
+        is_today_holiday = any(r['date'] == today_str and r.get('exception_type') == '1' for r in calendar_dates_rows)
+        all_service_ids = {t['service_id'] for t in trips_data.values()}
+        original_holiday_ids = {r['service_id'] for r in calendar_dates_rows if r.get('exception_type') == '1'}
+        if is_today_holiday: active_services.update(original_holiday_ids)
+        else: active_services.update(all_service_ids - original_holiday_ids)
+        for r in calendar_dates_rows:
+            if r['date'] == today_str:
+                if r['exception_type'] == '1': active_services.add(r['service_id'])
+                elif r['exception_type'] == '2': active_services.discard(r['service_id'])
+        for r in calendar_dates_rows:
+            if datetime.strptime(r['date'], '%Y%m%d').weekday() >= 5: holiday_schedule_ids.add(str(r['service_id']))
+            else: weekday_schedule_ids.add(str(r['service_id']))
         print(f"Заредени са {len(active_services)} активни услуги. {len(weekday_schedule_ids)} делнични и {len(holiday_schedule_ids)} празнични.", file=sys.stderr)
-
     except FileNotFoundError as e:
         print(f"КРИТИЧНА ГРЕШКА: Файлът {e.filename} не е намерен.", file=sys.stderr)
         raise
@@ -292,87 +234,65 @@ def load_static_data():
 def parse_gtfs_time(time_str: str, service_date: datetime, tz: pytz.timezone):
     try:
         h, m, s = map(int, time_str.split(':'))
-        naive_start_of_day = datetime(service_date.year, service_date.month, service_date.day)
-        time_offset = timedelta(hours=h, minutes=m, seconds=s)
-        naive_datetime = naive_start_of_day + time_offset
-        return tz.localize(naive_datetime)
+        return tz.localize(datetime(service_date.year, service_date.month, service_date.day) + timedelta(hours=h, minutes=m, seconds=s))
     except (ValueError, IndexError, TypeError): return None
 
 def precompute_all_route_details():
     global precomputed_route_details_cache
-    precomputed_route_details_cache.clear()
-    for trip_id, trip_info in trips_data.items():
-        shape_id = trip_info.get('shape_id')
-        if not shape_id: continue
-        # ============================ ПРОМЯНА (5/5) ============================
-        # Заменяме директния достъп с извикване на новата функция
-        shape_points = get_shape_by_id(shape_id)
-        # =====================================================================
-        if not shape_points: continue
-        if trip_id not in trip_stops_sequence: continue
+    for t_id, t_info in trips_data.items():
+        s_id = t_info.get('shape_id')
+        if not s_id: continue
+        shape_points = get_shape_by_id(s_id)
+        if not shape_points or t_id not in trip_stops_sequence: continue
         stops_list = []
-        for s in trip_stops_sequence.get(trip_id, []):
+        for s in trip_stops_sequence.get(t_id, []):
             stop_data = stops_data.get(s['stop_id'])
             if stop_data:
-                stop_copy = stop_data.copy()
-                stop_copy['stop_sequence'] = s['stop_sequence']
-                stop_copy['service_types'] = sorted(list(stop_service_info.get(s['stop_id'], {}).get('types', [])))
-                stops_list.append(stop_copy)
-        if not stops_list: continue
-        precomputed_route_details_cache[trip_id] = {"shape": shape_points, "stops": stops_list}
+                s_copy = stop_data.copy()
+                s_copy['stop_sequence'], s_copy['service_types'] = s['stop_sequence'], sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))
+                stops_list.append(s_copy)
+        if stops_list: precomputed_route_details_cache[t_id] = {"shape": shape_points, "stops": stops_list}
 
 def precompute_routes_by_line():
     global routes_by_line_cache
-    routes_by_line_cache.clear()
     lines_to_trips = {}
-    for trip_id, trip_info in trips_data.items():
-        route_id = trip_info.get('route_id')
-        if not route_id: continue
-        route_info = routes_data.get(route_id)
+    for t_id, t_info in trips_data.items():
+        r_id = t_info.get('route_id')
+        if not r_id: continue
+        route_info = routes_data.get(r_id)
         if not route_info: continue
-        line_number = route_info.get('route_short_name')
-        route_type = route_info.get('route_type')
-        if not line_number or not route_type: continue
-        line_key = (line_number, route_type)
-        if line_key not in lines_to_trips:
-            lines_to_trips[line_key] = []
-        lines_to_trips[line_key].append(trip_id)
-
-    for (line_number, route_type), trip_ids in lines_to_trips.items():
-        headsign_counts = Counter(trips_data[t_id].get('trip_headsign') for t_id in trip_ids if t_id in trips_data)
-        main_headsigns = {headsign for headsign, count in headsign_counts.most_common(2)}
-        processed_shapes_for_line = set()
-        for trip_id in trip_ids:
-            trip_info = trips_data.get(trip_id)
-            if not trip_info or trip_info.get('trip_headsign') not in main_headsigns: continue
-            shape_id = trip_info.get('shape_id')
-            if not shape_id or shape_id in processed_shapes_for_line: continue
-            # ============================ ПРОМЯНА (5/5) ============================
-            shape_points = get_shape_by_id(shape_id)
-            # =====================================================================
+        line_num, r_type = route_info.get('route_short_name'), route_info.get('route_type')
+        if not line_num or not r_type: continue
+        line_key = (line_num, r_type)
+        if line_key not in lines_to_trips: lines_to_trips[line_key] = []
+        lines_to_trips[line_key].append(t_id)
+    for (line_num, r_type), t_ids in lines_to_trips.items():
+        headsigns = Counter(trips_data[t_id].get('trip_headsign') for t_id in t_ids if t_id in trips_data)
+        main_headsigns = {h for h, c in headsigns.most_common(2)}
+        processed_shapes = set()
+        for t_id in t_ids:
+            t_info = trips_data.get(t_id)
+            if not t_info or t_info.get('trip_headsign') not in main_headsigns: continue
+            s_id = t_info.get('shape_id')
+            if not s_id or s_id in processed_shapes: continue
+            shape_points = get_shape_by_id(s_id)
             if not shape_points: continue
             stops_list = []
-            for s in trip_stops_sequence.get(trip_id, []):
+            for s in trip_stops_sequence.get(t_id,[]):
                 stop_data = stops_data.get(s['stop_id'])
                 if stop_data:
-                    stop_copy = stop_data.copy()
-                    stop_copy['stop_sequence'] = s['stop_sequence']
-                    stop_copy['service_types'] = sorted(list(stop_service_info.get(s['stop_id'], {}).get('types', [])))
-                    stops_list.append(stop_copy)
+                    s_copy = stop_data.copy()
+                    s_copy['stop_sequence'], s_copy['service_types'] = s['stop_sequence'], sorted(list(stop_service_info.get(s['stop_id'],{}).get('types',[])))
+                    stops_list.append(s_copy)
             if not stops_list: continue
-            route_variation_data = {
-                "direction": trip_info.get('trip_headsign', 'Н/И'),
-                "trip_id_sample": trip_id, "shape": shape_points, "stops": stops_list
-            }
-            if line_number not in routes_by_line_cache: routes_by_line_cache[line_number] = {}
-            if route_type not in routes_by_line_cache[line_number]: routes_by_line_cache[line_number][route_type] = []
-            routes_by_line_cache[line_number][route_type].append(route_variation_data)
-            processed_shapes_for_line.add(shape_id)
+            variation_data = {"direction":t_info.get('trip_headsign','Н/И'), "trip_id_sample":t_id, "shape":shape_points, "stops":stops_list}
+            if line_num not in routes_by_line_cache: routes_by_line_cache[line_num] = {}
+            if r_type not in routes_by_line_cache[line_num]: routes_by_line_cache[line_num][r_type] = []
+            routes_by_line_cache[line_num][r_type].append(variation_data)
+            processed_shapes.add(s_id)
 
 # ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
-
 def initialize_app():
-    """Функция, която ще се изпълни във фонова нишка, за да не блокира старта."""
     print("--- [BG Thread] Фоновото инициализиране започва...")
     print("--- [BG Thread] Зареждане на статични данни...")
     load_static_data()
@@ -383,38 +303,17 @@ def initialize_app():
     refresh_realtime_cache_if_needed()
     print("--- [BG Thread] Сървърът е напълно готов за работа. ---")
 
-# Извикваме само функции, които не четат големи файлове и са бързи
 print("--- Основният процес стартира. Подготовка на фонова нишка...")
-
-# Стартираме тежките изчисления в отделна нишка, за да не блокираме Gunicorn
 init_thread = threading.Thread(target=initialize_app)
 init_thread.start()
-
 print("--- Сървърът е стартиран и слуша за заявки. Инициализацията продължава на заден фон...")
 
 # ----------------- API ЕНДПОЙНТИ -----------------
-# (Всички ендпойнти остават същите)
-# ...
-
-@app.route('/api/shape/<trip_id>')
-def get_shape_for_trip(trip_id):
-    trip_info = trips_data.get(trip_id)
-    if not trip_info: return jsonify({"error": "Trip not found"}), 404
-    shape_id = trip_info.get('shape_id')
-    # ============================ ПРОМЯНА (5/5) ============================
-    shape_points = get_shape_by_id(shape_id)
-    # =====================================================================
-    return jsonify(shape_points)
-
-# ... Копирай останалите си ендпойнти от оригиналния файл тук ...
-# Те не се нуждаят от промяна.
 @app.route('/api/vehicles_for_stop/<stop_id>')
 def get_vehicles_for_stop(stop_id):
     try:
         refresh_realtime_cache_if_needed()
-        processed_alerts = get_processed_alerts()
-        now_dt = datetime.now(sofia_tz)
-        now_ts = int(time.time())
+        processed_alerts, now_dt, now_ts = get_processed_alerts(), datetime.now(sofia_tz), int(time.time())
         arrival_predictions = {e.trip_update.trip.trip_id: {stu.stop_id: stu.arrival.time for stu in e.trip_update.stop_time_update if stu.HasField('arrival') and stu.arrival.time > 0} for e in trip_updates_feed_cache.entity if e.HasField('trip_update')} if trip_updates_feed_cache else {}
         vehicle_positions = {e.vehicle.trip.trip_id: e.vehicle for e in vehicle_positions_feed_cache.entity if e.HasField('vehicle')} if vehicle_positions_feed_cache else {}
         stop_info = stops_data.get(stop_id)
@@ -425,241 +324,175 @@ def get_vehicles_for_stop(stop_id):
         all_arrivals = []
         trip_ids_for_stop = {tid for s_id in physical_stop_ids for tid in stop_to_trips_map.get(s_id, [])}
         with shared_data_lock:
-            stale_keys_official = [k for k, v in recent_official_arrivals_cache.items() if now_ts - v > RECENT_OFFICIAL_TTL_SECONDS]
-            for k in stale_keys_official: del recent_official_arrivals_cache[k]
-            stale_keys_gps = [k for k, v in gps_arrival_cache.items() if now_ts - v > GPS_CACHE_TTL_SECONDS]
-            for k in stale_keys_gps: del gps_arrival_cache[k]
-        for trip_id in trip_ids_for_stop:
-            trip_info = trips_data.get(trip_id)
+            for k in [k for k,v in recent_official_arrivals_cache.items() if now_ts - v > RECENT_OFFICIAL_TTL_SECONDS]: del recent_official_arrivals_cache[k]
+            for k in [k for k,v in gps_arrival_cache.items() if now_ts - v > GPS_CACHE_TTL_SECONDS]: del gps_arrival_cache[k]
+        for t_id in trip_ids_for_stop:
+            trip_info = trips_data.get(t_id)
             if not trip_info: continue
-            trip_schedule_for_stops = schedule_by_trip.get(trip_id, {})
-            relevant_stop_id = next((s_id for s_id in physical_stop_ids if s_id in trip_schedule_for_stops), None)
-            if not relevant_stop_id: continue
+            trip_schedule = schedule_by_trip.get(t_id, {})
+            rel_stop_id = next((s_id for s_id in physical_stop_ids if s_id in trip_schedule), None)
+            if not rel_stop_id: continue
             route_info = routes_data.get(trip_info['route_id'])
             if not route_info: continue
-            eta_minutes, prediction_source, is_live_data = None, None, False
-            predicted_arrival_ts = arrival_predictions.get(trip_id, {}).get(relevant_stop_id)
-            if predicted_arrival_ts and predicted_arrival_ts > now_ts - 60:
-                eta_minutes = max(0, round((predicted_arrival_ts - now_ts) / 60))
-                prediction_source = "official"
-                is_live_data = True
-                if eta_minutes == 0:
-                    with shared_data_lock: recent_official_arrivals_cache[(trip_id, relevant_stop_id)] = now_ts
-            elif trip_id in vehicle_positions:
-                is_live_data = True
+            eta_min, pred_src, is_live = None, None, False
+            pred_ts = arrival_predictions.get(t_id, {}).get(rel_stop_id)
+            if pred_ts and pred_ts > now_ts - 60:
+                eta_min, pred_src, is_live = max(0, round((pred_ts - now_ts) / 60)), "official", True
+                if eta_min == 0:
+                    with shared_data_lock: recent_official_arrivals_cache[(t_id, rel_stop_id)] = now_ts
+            elif t_id in vehicle_positions:
+                is_live = True
                 with shared_data_lock:
-                    if (trip_id, relevant_stop_id) in recent_official_arrivals_cache: continue
-                vehicle = vehicle_positions[trip_id]
-                target_stop_info = stops_data.get(relevant_stop_id)
-                distance_to_our_stop = None
-                if vehicle.HasField('position') and target_stop_info and target_stop_info.get('stop_lat'):
-                    distance_to_our_stop = haversine_distance(vehicle.position.latitude, vehicle.position.longitude, float(target_stop_info['stop_lat']), float(target_stop_info['stop_lon']))
-                cache_key = (trip_id, relevant_stop_id)
-                with shared_data_lock: was_in_arrival_zone = cache_key in gps_arrival_cache
-                if was_in_arrival_zone and distance_to_our_stop is not None and distance_to_our_stop > DEPARTURE_ZONE_METERS:
+                    if (t_id, rel_stop_id) in recent_official_arrivals_cache: continue
+                vehicle, target_stop = vehicle_positions[t_id], stops_data.get(rel_stop_id)
+                dist_to_stop = haversine_distance(vehicle.position.latitude, vehicle.position.longitude, float(target_stop['stop_lat']), float(target_stop['stop_lon'])) if vehicle.HasField('position') and target_stop and target_stop.get('stop_lat') else None
+                cache_key = (t_id, rel_stop_id)
+                with shared_data_lock: was_in_zone = cache_key in gps_arrival_cache
+                if was_in_zone and dist_to_stop is not None and dist_to_stop > DEPARTURE_ZONE_METERS:
                     with shared_data_lock:
                         if cache_key in gps_arrival_cache: del gps_arrival_cache[cache_key]
                     continue
-                if distance_to_our_stop is not None and distance_to_our_stop < ARRIVAL_ZONE_METERS:
-                    eta_minutes, prediction_source = 0, "hybrid"
-                    if not was_in_arrival_zone:
+                if (dist_to_stop is not None and dist_to_stop < ARRIVAL_ZONE_METERS) or was_in_zone:
+                    eta_min, pred_src = 0, "hybrid"
+                    if not was_in_zone:
                         with shared_data_lock: gps_arrival_cache[cache_key] = now_ts
-                elif was_in_arrival_zone:
-                     eta_minutes, prediction_source = 0, "hybrid"
                 else:
                     use_hybrid = False
-                    next_gps_stop_id = vehicle.stop_id if vehicle.HasField('stop_id') else None
-                    if next_gps_stop_id and vehicle.HasField('position'):
-                        our_stop_seq = trip_stop_sequences_map.get(trip_id, {}).get(relevant_stop_id)
-                        next_stop_seq = trip_stop_sequences_map.get(trip_id, {}).get(next_gps_stop_id)
-                        if our_stop_seq is not None and next_stop_seq is not None and next_stop_seq < our_stop_seq:
-                            prev_stop_info = stops_data.get(next_gps_stop_id)
-                            if prev_stop_info and prev_stop_info.get('stop_lat'):
-                                dist_to_prev_stop = haversine_distance(vehicle.position.latitude, vehicle.position.longitude, float(prev_stop_info['stop_lat']), float(prev_stop_info['stop_lon']))
-                                if dist_to_prev_stop is not None and dist_to_prev_stop < HYBRID_TRIGGER_ZONE_METERS:
-                                    use_hybrid = True
+                    next_gps_stop = vehicle.stop_id if vehicle.HasField('stop_id') else None
+                    if next_gps_stop and vehicle.HasField('position'):
+                        our_seq, next_seq = trip_stop_sequences_map.get(t_id, {}).get(rel_stop_id), trip_stop_sequences_map.get(t_id, {}).get(next_gps_stop)
+                        if our_seq is not None and next_seq is not None and next_seq < our_seq:
+                            prev_stop = stops_data.get(next_gps_stop)
+                            if prev_stop and prev_stop.get('stop_lat'):
+                                dist_to_prev = haversine_distance(vehicle.position.latitude, vehicle.position.longitude, float(prev_stop['stop_lat']), float(prev_stop['stop_lon']))
+                                if dist_to_prev is not None and dist_to_prev < HYBRID_TRIGGER_ZONE_METERS: use_hybrid = True
                     if use_hybrid:
-                        route_type = route_info.get('route_type', 'DEFAULT')
-                        avg_speed = AVG_SPEED_MPS.get(route_type, AVG_SPEED_MPS['DEFAULT'])
-                        vehicle_speed_mps = vehicle.position.speed if vehicle.position.HasField('speed') and vehicle.position.speed > 1 else avg_speed
-                        if distance_to_our_stop is not None and vehicle_speed_mps > 0:
-                            eta_seconds = distance_to_our_stop / vehicle_speed_mps
-                            eta_minutes, prediction_source = max(0, round(eta_seconds / 60)), "hybrid"
-            if prediction_source is None:
-                if trip_info.get('service_id') in active_services:
-                    scheduled_time_str = trip_schedule_for_stops.get(relevant_stop_id, "")
-                    scheduled_dt_aware = parse_gtfs_time(scheduled_time_str, now_dt, sofia_tz)
-                    if scheduled_dt_aware and now_dt < scheduled_dt_aware < now_dt + timedelta(hours=2):
-                        eta_minutes = max(0, round((scheduled_dt_aware - now_dt).total_seconds() / 60))
-                        prediction_source = "schedule"
-                        is_live_data = False
-            if prediction_source is not None:
-                route_short_name = route_info.get('route_short_name', 'Н/А')
-                route_type = route_info.get('route_type')
-                alert_messages = processed_alerts.get(f"{route_short_name}-{route_type}")
-                all_arrivals.append({ "trip_id": trip_id, "route_name": route_short_name, "route_type": route_type, "destination": trip_info.get('trip_headsign', 'Н/И'), "eta_minutes": eta_minutes, "prediction_source": prediction_source, "is_live": is_live_data, "alerts": alert_messages })
+                        r_type = route_info.get('route_type', 'DEFAULT')
+                        avg_speed = AVG_SPEED_MPS.get(r_type, AVG_SPEED_MPS['DEFAULT'])
+                        v_speed = vehicle.position.speed if vehicle.position.HasField('speed') and vehicle.position.speed > 1 else avg_speed
+                        if dist_to_stop is not None and v_speed > 0:
+                            eta_min, pred_src = max(0, round((dist_to_stop / v_speed) / 60)), "hybrid"
+            if pred_src is None and trip_info.get('service_id') in active_services:
+                sched_time_str = trip_schedule.get(rel_stop_id, "")
+                sched_dt = parse_gtfs_time(sched_time_str, now_dt, sofia_tz)
+                if sched_dt and now_dt < sched_dt < now_dt + timedelta(hours=2):
+                    eta_min, pred_src, is_live = max(0, round((sched_dt - now_dt).total_seconds() / 60)), "schedule", False
+            if pred_src is not None:
+                r_name, r_type = route_info.get('route_short_name', 'Н/А'), route_info.get('route_type')
+                all_arrivals.append({"trip_id": t_id, "route_name": r_name, "route_type": r_type, "destination": trip_info.get('trip_headsign', 'Н/И'), "eta_minutes": eta_min, "prediction_source": pred_src, "is_live": is_live, "alerts": processed_alerts.get(f"{r_name}-{r_type}")})
         all_arrivals.sort(key=lambda x: (not x['is_live'], x['eta_minutes']))
         return jsonify(all_arrivals)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_vehicles_for_stop: {e}", file=sys.stderr)
-        return jsonify({"error": "An internal server error occurred."}), 500
-        
-# ... (и всички останали, които не съм включил тук, за краткост)
-
-@app.route('/api/bulk_arrivals_for_stops', methods=['POST'])
-def get_bulk_arrivals_for_stops():
-    try:
-        refresh_realtime_cache_if_needed()
-        stop_codes_to_query = set(request.json.get('stop_codes', []));
-        if not stop_codes_to_query: return jsonify({})
-        now_dt = datetime.now(sofia_tz); now_ts = int(time.time())
-        arrival_predictions = {}
-        if trip_updates_feed_cache:
-            for entity in trip_updates_feed_cache.entity:
-                if entity.HasField('trip_update'):
-                    update = entity.trip_update; trip_id = update.trip.trip_id
-                    if trip_id not in arrival_predictions: arrival_predictions[trip_id] = {}
-                    for stu in update.stop_time_update:
-                        if stu.HasField('arrival') and stu.arrival.time > 0: arrival_predictions[trip_id][stu.stop_id] = stu.arrival.time
-        stop_code_to_ids_map = {}
-        for s_id, s_data in stops_data.items():
-            code = s_data.get('stop_code')
-            if code in stop_codes_to_query:
-                if code not in stop_code_to_ids_map: stop_code_to_ids_map[code] = []
-                stop_code_to_ids_map[code].append(s_id)
-        bulk_results = {}; trips_to_check = set()
-        for code in stop_codes_to_query:
-            for stop_id in stop_code_to_ids_map.get(code, []): trips_to_check.update(stop_to_trips_map.get(stop_id, []))
-        for trip_id in trips_to_check:
-            trip_info = trips_data.get(trip_id)
-            if not trip_info or trip_info.get('service_id') not in active_services: continue
-            for stop_id_in_schedule, scheduled_time_str in schedule_by_trip.get(trip_id, {}).items():
-                stop_details = stops_data.get(stop_id_in_schedule)
-                if not stop_details: continue
-                stop_code = stop_details.get('stop_code')
-                if stop_code in stop_codes_to_query:
-                    is_upcoming = False
-                    predicted_arrival_ts = arrival_predictions.get(trip_id, {}).get(stop_id_in_schedule)
-                    if predicted_arrival_ts and predicted_arrival_ts > now_ts - 60: is_upcoming = True
-                    else:
-                        scheduled_dt_aware = parse_gtfs_time(scheduled_time_str, now_dt, sofia_tz)
-                        if scheduled_dt_aware and now_dt < scheduled_dt_aware < now_dt + timedelta(hours=2): is_upcoming = True
-                    if is_upcoming:
-                        if stop_code not in bulk_results: bulk_results[stop_code] = {'arrivals': set()}
-                        route_info = routes_data.get(trip_info['route_id'])
-                        route_type_str = route_info.get('route_type', '')
-                        route_name = route_info.get('route_short_name', '')
-                        transport_type = 'BUS'
-                        if route_name.startswith('N'): transport_type = 'NIGHT'
-                        elif route_type_str == '0': transport_type = 'TRAM'
-                        elif route_type_str == '11': transport_type = 'TROLLEY'
-                        bulk_results[stop_code]['arrivals'].add(transport_type)
-        final_results = {code: {'arrivals': list(data['arrivals'])} for code, data in bulk_results.items()}
-        return jsonify(final_results)
-    except Exception as e:
-        print(f"КРИТИЧНА ГРЕШКА в get_bulk_arrivals_for_stops: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/api/bulk_detailed_arrivals', methods=['POST'])
 def get_bulk_detailed_arrivals():
     try:
         refresh_realtime_cache_if_needed()
-        processed_alerts = get_processed_alerts()
-        stop_codes_to_query = set(request.json.get('stop_codes', []));
-        if not stop_codes_to_query: return jsonify({})
-        now_dt = datetime.now(sofia_tz); now_ts = int(time.time())
-        arrival_predictions = {}
-        if trip_updates_feed_cache:
-            for entity in trip_updates_feed_cache.entity:
-                if entity.HasField('trip_update'):
-                    update = entity.trip_update; trip_id = update.trip.trip_id
-                    if trip_id not in arrival_predictions: arrival_predictions[trip_id] = {}
-                    for stu in update.stop_time_update:
-                        if stu.HasField('arrival') and stu.arrival.time > 0: arrival_predictions[trip_id][stu.stop_id] = stu.arrival.time
+        processed_alerts, stop_codes = get_processed_alerts(), set(request.json.get('stop_codes', []))
+        if not stop_codes: return jsonify({})
+        now_dt, now_ts = datetime.now(sofia_tz), int(time.time())
+        arrival_predictions = {e.trip_update.trip.trip_id: {stu.stop_id: stu.arrival.time for stu in e.trip_update.stop_time_update if stu.HasField('arrival') and stu.arrival.time > 0} for e in trip_updates_feed_cache.entity if e.HasField('trip_update')} if trip_updates_feed_cache else {}
         vehicle_positions = {e.vehicle.trip.trip_id: e.vehicle for e in vehicle_positions_feed_cache.entity if e.HasField('vehicle')} if vehicle_positions_feed_cache else {}
-        final_results = {code: [] for code in stop_codes_to_query}; relevant_stop_ids = set(); stop_id_to_code_map = {}
+        final_results = {code: [] for code in stop_codes}; rel_stop_ids, stop_id_to_code = set(), {}
         for s_id, s_data in stops_data.items():
             code = s_data.get('stop_code')
-            if code in stop_codes_to_query: relevant_stop_ids.add(s_id); stop_id_to_code_map[s_id] = code
-        trips_to_check = set()
-        for stop_id in relevant_stop_ids: trips_to_check.update(stop_to_trips_map.get(stop_id, []))
-        for trip_id in trips_to_check:
-            trip_info = trips_data.get(trip_id)
+            if code in stop_codes: rel_stop_ids.add(s_id); stop_id_to_code[s_id] = code
+        trips_to_check = {tid for s_id in rel_stop_ids for tid in stop_to_trips_map.get(s_id, [])}
+        for t_id in trips_to_check:
+            trip_info = trips_data.get(t_id)
             if not trip_info: continue
             route_info = routes_data.get(trip_info['route_id'])
             if not route_info: continue
-            for stop_id_in_schedule, scheduled_time_str in schedule_by_trip.get(trip_id, {}).items():
-                if stop_id_in_schedule in relevant_stop_ids:
-                    eta_minutes, prediction_source, is_live = -1, None, False
-                    predicted_arrival_ts = arrival_predictions.get(trip_id, {}).get(stop_id_in_schedule)
-                    if predicted_arrival_ts and predicted_arrival_ts > now_ts - 60:
-                        eta_minutes = max(0, round((predicted_arrival_ts - now_ts) / 60)); prediction_source = "official"; is_live = True
-                    elif trip_id in vehicle_positions:
-                         prediction_source = "hybrid"; is_live = True
-                    if not is_live:
-                         if trip_info.get('service_id') in active_services:
-                            scheduled_dt_aware = parse_gtfs_time(scheduled_time_str, now_dt, sofia_tz)
-                            if scheduled_dt_aware and now_dt < scheduled_dt_aware < now_dt + timedelta(hours=2):
-                                eta_minutes = max(0, round((scheduled_dt_aware - now_dt).total_seconds() / 60)); prediction_source = "schedule"
-                    else:
-                        if eta_minutes == -1:
-                           scheduled_dt_aware = parse_gtfs_time(scheduled_time_str, now_dt, sofia_tz)
-                           if scheduled_dt_aware and now_dt < scheduled_dt_aware < now_dt + timedelta(hours=2):
-                               eta_minutes = max(0, round((scheduled_dt_aware - now_dt).total_seconds() / 60))
-                    if prediction_source and eta_minutes != -1:
-                        route_short_name = route_info.get('route_short_name', 'Н/А')
-                        route_type = route_info.get('route_type')
-                        alert_messages = processed_alerts.get(f"{route_short_name}-{route_type}")
-                        arrival_object = {
-                            "trip_id": trip_id, "route_name": route_short_name, "route_type": route_type,
-                            "destination": trip_info.get('trip_headsign', 'Н/И'), "eta_minutes": eta_minutes,
-                            "prediction_source": prediction_source, "is_live": is_live, "alerts": alert_messages
-                        }
-                        stop_code = stop_id_to_code_map[stop_id_in_schedule]
-                        final_results[stop_code].append(arrival_object)
+            for s_id, sched_time in schedule_by_trip.get(t_id, {}).items():
+                if s_id in rel_stop_ids:
+                    eta_min, pred_src, is_live = -1, None, False
+                    pred_ts = arrival_predictions.get(t_id, {}).get(s_id)
+                    if pred_ts and pred_ts > now_ts - 60:
+                        eta_min, pred_src, is_live = max(0, round((pred_ts - now_ts) / 60)), "official", True
+                    elif t_id in vehicle_positions: pred_src, is_live = "hybrid", True
+                    if not is_live and trip_info.get('service_id') in active_services:
+                        sched_dt = parse_gtfs_time(sched_time, now_dt, sofia_tz)
+                        if sched_dt and now_dt < sched_dt < now_dt + timedelta(hours=2): eta_min, pred_src = max(0, round((sched_dt - now_dt).total_seconds() / 60)), "schedule"
+                    elif is_live and eta_min == -1:
+                        sched_dt = parse_gtfs_time(sched_time, now_dt, sofia_tz)
+                        if sched_dt and now_dt < sched_dt < now_dt + timedelta(hours=2): eta_min = max(0, round((sched_dt - now_dt).total_seconds() / 60))
+                    if pred_src and eta_min != -1:
+                        r_name, r_type = route_info.get('route_short_name', 'Н/А'), route_info.get('route_type')
+                        final_results[stop_id_to_code[s_id]].append({"trip_id": t_id, "route_name": r_name, "route_type": r_type, "destination": trip_info.get('trip_headsign', 'Н/И'), "eta_minutes": eta_min, "prediction_source": pred_src, "is_live": is_live, "alerts": processed_alerts.get(f"{r_name}-{r_type}")})
         for code in final_results: final_results[code].sort(key=lambda x: (not x['is_live'], x['eta_minutes']))
         return jsonify(final_results)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_bulk_detailed_arrivals: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
+@app.route('/api/bulk_arrivals_for_stops', methods=['POST'])
+def get_bulk_arrivals_for_stops():
+    try:
+        refresh_realtime_cache_if_needed()
+        stop_codes = set(request.json.get('stop_codes', []))
+        if not stop_codes: return jsonify({})
+        now_dt, now_ts = datetime.now(sofia_tz), int(time.time())
+        arrival_predictions = {e.trip_update.trip.trip_id: {stu.stop_id: stu.arrival.time for stu in e.trip_update.stop_time_update if stu.HasField('arrival') and stu.arrival.time > 0} for e in trip_updates_feed_cache.entity if e.HasField('trip_update')} if trip_updates_feed_cache else {}
+        stop_code_to_ids = {code:[] for code in stop_codes}
+        for s_id, s_data in stops_data.items():
+            code = s_data.get('stop_code')
+            if code in stop_codes: stop_code_to_ids[code].append(s_id)
+        bulk_results = {}
+        trips_to_check = {tid for code in stop_codes for s_id in stop_code_to_ids.get(code,[]) for tid in stop_to_trips_map.get(s_id,[])}
+        for t_id in trips_to_check:
+            trip_info = trips_data.get(t_id)
+            if not trip_info or trip_info.get('service_id') not in active_services: continue
+            for s_id, sched_time in schedule_by_trip.get(t_id, {}).items():
+                s_details = stops_data.get(s_id)
+                if not s_details: continue
+                s_code = s_details.get('stop_code')
+                if s_code in stop_codes:
+                    is_upcoming = False
+                    if arrival_predictions.get(t_id, {}).get(s_id) and arrival_predictions[t_id][s_id] > now_ts - 60: is_upcoming = True
+                    else:
+                        sched_dt = parse_gtfs_time(sched_time, now_dt, sofia_tz)
+                        if sched_dt and now_dt < sched_dt < now_dt + timedelta(hours=2): is_upcoming = True
+                    if is_upcoming:
+                        if s_code not in bulk_results: bulk_results[s_code] = {'arrivals': set()}
+                        r_info = routes_data.get(trip_info['route_id'])
+                        r_type, r_name = r_info.get('route_type', ''), r_info.get('route_short_name', '')
+                        transport_type = 'BUS'
+                        if r_name.startswith('N'): transport_type = 'NIGHT'
+                        elif r_type == '0': transport_type = 'TRAM'
+                        elif r_type == '11': transport_type = 'TROLLEY'
+                        bulk_results[s_code]['arrivals'].add(transport_type)
+        return jsonify({c: {'arrivals': list(d['arrivals'])} for c, d in bulk_results.items()})
+    except Exception as e:
+        print(f"КРИТИЧНА ГРЕШКА в get_bulk_arrivals_for_stops: {e}", file=sys.stderr)
+        return jsonify({"error": "An internal server error occurred."}), 500
+
+# Всички останали ендпойнти без промяна
 @app.route('/api/schedule_for_stop/<stop_code>')
 def get_schedule_for_stop(stop_code):
     try:
         relevant_stop_ids = {s_id for s_id, s_data in stops_data.items() if s_data.get('stop_code') == stop_code}
-        if not relevant_stop_ids:
-            return jsonify({"error": "Stop with this code not found"}), 404
+        if not relevant_stop_ids: return jsonify({"error": "Stop not found"}), 404
         schedule = {"weekday": {}, "holiday": {}}
         trip_ids_for_stop = {tid for s_id in relevant_stop_ids for tid in stop_to_trips_map.get(s_id, [])}
-        for trip_id in trip_ids_for_stop:
-            trip_info = trips_data.get(trip_id)
+        for t_id in trip_ids_for_stop:
+            trip_info = trips_data.get(t_id)
             if not trip_info: continue
             service_id = str(trip_info['service_id'])
-            def add_to_schedule(target_schedule):
+            def add_to_schedule(target):
                 route_info = routes_data.get(trip_info['route_id'])
                 if not route_info: return
-                route_name = route_info.get('route_short_name', 'Н/А')
-                destination = trip_info.get('trip_headsign', 'Н/И')
-                route_type = route_info.get('route_type', '3')
-                arrival_time = None
-                trip_schedule_for_stops = schedule_by_trip.get(trip_id, {})
-                for stop_id in relevant_stop_ids:
-                    if stop_id in trip_schedule_for_stops:
-                        arrival_time = trip_schedule_for_stops[stop_id]
-                        break
-                if not arrival_time: return
-                if route_name not in target_schedule:
-                    target_schedule[route_name] = {}
-                if destination not in target_schedule[route_name]:
-                    target_schedule[route_name][destination] = {"times": [], "route_type": route_type}
-                target_schedule[route_name][destination]["times"].append(arrival_time)
-            if service_id in holiday_schedule_ids:
-                add_to_schedule(schedule["holiday"])
-            elif service_id in weekday_schedule_ids:
-                add_to_schedule(schedule["weekday"])
-        for schedule_type in schedule.values():
-            for route in schedule_type.values():
+                r_name, dest, r_type = route_info.get('route_short_name', 'Н/А'), trip_info.get('trip_headsign', 'Н/И'), route_info.get('route_type', '3')
+                arr_time = next((schedule_by_trip.get(t_id, {}).get(s_id) for s_id in relevant_stop_ids if s_id in schedule_by_trip.get(t_id, {})), None)
+                if not arr_time: return
+                if r_name not in target: target[r_name] = {}
+                if dest not in target[r_name]: target[r_name][dest] = {"times": [], "route_type": r_type}
+                target[r_name][dest]["times"].append(arr_time)
+            if service_id in holiday_schedule_ids: add_to_schedule(schedule["holiday"])
+            elif service_id in weekday_schedule_ids: add_to_schedule(schedule["weekday"])
+        for sched_type in schedule.values():
+            for route in sched_type.values():
                 for dest_data in route.values():
                     dest_data["times"] = sorted(list(set(dest_data["times"])), key=lambda t: tuple(map(int, t.split(':'))))
         return jsonify(schedule)
@@ -667,44 +500,25 @@ def get_schedule_for_stop(stop_code):
         print(f"КРИТИЧНА ГРЕШКА в get_schedule_for_stop: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
-# ---- Останалите ендпойнти ----
-
 @app.route('/api/vehicles_for_routes/<route_names_str>')
 def get_vehicles_for_routes(route_names_str):
     try:
         refresh_realtime_cache_if_needed()
-        requested_routes = set(route_names_str.split(','))
+        req_routes = set(route_names_str.split(','))
         if not vehicle_positions_feed_cache: return jsonify([])
-        vehicles_on_routes = []
+        vehicles = []
         for entity in vehicle_positions_feed_cache.entity:
             if entity.HasField('vehicle'):
-                vehicle = entity.vehicle; trip_id = vehicle.trip.trip_id
-                trip_info = trips_data.get(trip_id)
+                v = entity.vehicle; t_id = v.trip.trip_id
+                trip_info = trips_data.get(t_id)
                 if not trip_info: continue
                 route_info = routes_data.get(trip_info['route_id'])
-                if route_info and route_info.get('route_short_name') in requested_routes:
-                    vehicles_on_routes.append({
-                        "latitude": vehicle.position.latitude if vehicle.HasField('position') else None,
-                        "longitude": vehicle.position.longitude if vehicle.HasField('position') else None,
-                        "trip_id": trip_id, "route_name": route_info.get('route_short_name'),
-                        "route_type": route_info.get('route_type', ''),
-                        "destination": trip_info.get('trip_headsign', 'Н/И'),
-                        "next_stop_id": vehicle.stop_id if vehicle.HasField('stop_id') else None,
-                        "stop_sequence": vehicle.current_stop_sequence if vehicle.HasField('current_stop_sequence') else None
-                    })
-        return jsonify(vehicles_on_routes)
+                if route_info and route_info.get('route_short_name') in req_routes:
+                    vehicles.append({"latitude": v.position.latitude if v.HasField('position') else None, "longitude": v.position.longitude if v.HasField('position') else None, "trip_id": t_id, "route_name": route_info.get('route_short_name'), "route_type": route_info.get('route_type', ''), "destination": trip_info.get('trip_headsign', 'Н/И'), "next_stop_id": v.stop_id if v.HasField('stop_id') else None, "stop_sequence": v.current_stop_sequence if v.HasField('current_stop_sequence') else None})
+        return jsonify(vehicles)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_vehicles_for_routes: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
-
-@app.route('/api/shape/<trip_id>')
-def get_shape_for_trip(trip_id):
-    trip_info = trips_data.get(trip_id)
-    if not trip_info: return jsonify({"error": "Trip not found"}), 404
-    shape_id = trip_info.get('shape_id')
-    # ИЗПОЛЗВА get_shape_by_id
-    shape_points = get_shape_by_id(shape_id)
-    return jsonify(shape_points)
 
 @app.route('/api/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
@@ -713,9 +527,9 @@ def get_stops_for_trip(trip_id):
     for s in trip_stops_sequence.get(trip_id, []):
         stop_data = stops_data.get(s['stop_id'])
         if stop_data:
-            stop_copy = stop_data.copy()
-            stop_copy['stop_sequence'] = s['stop_sequence']
-            stops_list.append(stop_copy)
+            s_copy = stop_data.copy()
+            s_copy['stop_sequence'] = s['stop_sequence']
+            stops_list.append(s_copy)
     return jsonify(stops_list)
 
 @app.route('/api/all_routes')
@@ -724,116 +538,81 @@ def get_all_routes():
 
 @app.route('/api/all_stops')
 def get_all_stops():
-    enriched_stops = []
-    for stop_id, stop_data in stops_data.items():
-        info = stop_service_info.get(stop_id, {})
-        stop_copy = stop_data.copy()
-        stop_copy['service_types'] = sorted(list(info.get('types', [])))
-        enriched_stops.append(stop_copy)
-    return jsonify(enriched_stops)
+    return jsonify([dict(s_data, service_types=sorted(list(stop_service_info.get(s_id, {}).get('types', []))))) for s_id, s_data in stops_data.items()])
 
 @app.route('/api/all_lines_structured')
 def get_all_lines_structured():
     try:
         structured_lines = {}
-        for trip_id, trip_info in trips_data.items():
-            route_id = trip_info.get('route_id')
-            if not route_id: continue
-            if route_id not in structured_lines:
-                route_info = routes_data.get(route_id)
-                if not route_info: continue
-                route_short_name = route_info.get('route_short_name', 'Н/А')
-                route_type_code = route_info.get('route_type', '3')
-                transport_type_str = 'BUS'
-                if route_short_name.startswith('N'): transport_type_str = 'NIGHT'
-                elif route_type_code == '0': transport_type_str = 'TRAM'
-                elif route_type_code == '11': transport_type_str = 'TROLLEY'
-                elif route_type_code in ['1', '2']: transport_type_str = 'METRO'
-                structured_lines[route_id] = {
-                    "line_name": route_short_name,
-                    "transport_type": transport_type_str,
-                    "directions": {}
-                }
-            direction_id = trip_info.get('direction_id', '0')
-            if direction_id not in structured_lines[route_id]["directions"]:
-                structured_lines[route_id]["directions"][direction_id] = {
-                    "headsign": trip_info.get('trip_headsign', 'Н/И'),
-                    "example_trip_id": trip_id
-                }
+        for t_id, t_info in trips_data.items():
+            r_id = t_info.get('route_id')
+            if not r_id or r_id in structured_lines: continue
+            r_info = routes_data.get(r_id)
+            if not r_info: continue
+            r_name, r_type = r_info.get('route_short_name', 'Н/А'), r_info.get('route_type', '3')
+            transport_type = 'BUS'
+            if r_name.startswith('N'): transport_type = 'NIGHT'
+            elif r_type == '0': transport_type = 'TRAM'
+            elif r_type == '11': transport_type = 'TROLLEY'
+            elif r_type in ['1','2']: transport_type = 'METRO'
+            structured_lines[r_id] = {"line_name": r_name, "transport_type": transport_type, "directions": {}}
+        for t_id, t_info in trips_data.items():
+            r_id = t_info.get('route_id')
+            if r_id in structured_lines:
+                dir_id = t_info.get('direction_id', '0')
+                if dir_id not in structured_lines[r_id]["directions"]:
+                    structured_lines[r_id]["directions"][dir_id] = {"headsign": t_info.get('trip_headsign', 'Н/И'), "example_trip_id": t_id}
         final_list = []
-        for route_id, line_data in structured_lines.items():
+        for r_id, line_data in structured_lines.items():
             line_data["directions"] = list(line_data["directions"].values())
             final_list.append(line_data)
         return jsonify(final_list)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_all_lines_structured: {e}", file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
-        
+
 @app.route('/api/line_details/<line_number>/<route_type_code>')
 def get_line_details(line_number, route_type_code):
-    line_data = routes_by_line_cache.get(line_number, {}).get(route_type_code)
-    if not line_data:
-        return jsonify({"error": f"Няма данни за линия номер {line_number} от тип {route_type_code}."}), 404
-    return jsonify(line_data)
+    return jsonify(routes_by_line_cache.get(line_number, {}).get(route_type_code, []))
 
 @app.route('/api/full_route_view/<trip_id>')
 def get_full_route_view(trip_id):
     try:
         cached_data = precomputed_route_details_cache.get(trip_id)
-        if not cached_data:
-            return jsonify({"error": f"Static route details for trip {trip_id} not found in cache."}), 404
+        if not cached_data: return jsonify({"error": f"Static route details not found for trip {trip_id}."}), 404
         trip_info = trips_data.get(trip_id)
-        if not trip_info:
-             return jsonify({"error": f"Trip info for {trip_id} not found."}), 404
+        if not trip_info: return jsonify({"error": f"Trip info for {trip_id} not found."}), 404
         route_info = routes_data.get(trip_info.get('route_id'))
-        if not route_info:
-            return jsonify({"error": f"Route info for trip {trip_id} not found."}), 404
-        route_name_to_fetch = route_info.get('route_short_name')
+        if not route_info: return jsonify({"error": f"Route info for trip {trip_id} not found."}), 404
+        r_name_fetch = route_info.get('route_short_name')
         refresh_realtime_cache_if_needed()
         live_vehicles = []
         if vehicle_positions_feed_cache:
             for entity in vehicle_positions_feed_cache.entity:
                 if entity.HasField('vehicle'):
-                    vehicle = entity.vehicle
-                    v_trip_id = vehicle.trip.trip_id
-                    v_trip_info = trips_data.get(v_trip_id)
+                    v = entity.vehicle; t_id = v.trip.trip_id
+                    v_trip_info = trips_data.get(t_id)
                     if not v_trip_info: continue
                     v_route_info = routes_data.get(v_trip_info.get('route_id'))
-                    if v_route_info and v_route_info.get('route_short_name') == route_name_to_fetch:
-                        live_vehicles.append({
-                            "latitude": vehicle.position.latitude if vehicle.HasField('position') else 0,
-                            "longitude": vehicle.position.longitude if vehicle.HasField('position') else 0,
-                            "trip_id": v_trip_id,
-                            "route_name": v_route_info.get('route_short_name'),
-                            "route_type": v_route_info.get('route_type', ''),
-                            "destination": v_trip_info.get('trip_headsign', 'Н/И')
-                        })
-        full_response = {
-            "shape": cached_data["shape"],
-            "stops": cached_data["stops"],
-            "vehicles": live_vehicles
-        }
-        return jsonify(full_response)
+                    if v_route_info and v_route_info.get('route_short_name') == r_name_fetch:
+                        live_vehicles.append({"latitude": v.position.latitude if v.HasField('position') else 0, "longitude": v.position.longitude if v.HasField('position') else 0, "trip_id": t_id, "route_name": v_route_info.get('route_short_name'), "route_type": v_route_info.get('route_type', ''), "destination": v_trip_info.get('trip_headsign', 'Н/И')})
+        return jsonify({"shape": cached_data["shape"], "stops": cached_data["stops"], "vehicles": live_vehicles})
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_full_route_view: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/api/static_route_view/<trip_id>')
 def get_static_route_view(trip_id):
     cached_data = precomputed_route_details_cache.get(trip_id)
-    if not cached_data:
-        return jsonify({"error": f"Static route details for trip {trip_id} not found in cache."}), 404
-    return jsonify({"shape": cached_data.get("shape", []),"stops": cached_data.get("stops", [])})
+    if not cached_data: return jsonify({"error": f"Static route details not found for trip {trip_id}."}), 404
+    return jsonify({"shape": cached_data.get("shape", []), "stops": cached_data.get("stops", [])})
 
 @app.route('/api/debug/alerts_raw')
 def debug_alerts_raw():
     try:
         refresh_realtime_cache_if_needed()
-        if not alerts_feed_cache:
-            return jsonify({"error": "Alerts фийдът не е зареден."}), 500
-        text_output = str(alerts_feed_cache)
-        return Response(text_output, mimetype='text/plain; charset=utf-8')
+        if not alerts_feed_cache: return jsonify({"error": "Alerts фийдът не е зареден."}), 500
+        return Response(str(alerts_feed_cache), mimetype='text/plain; charset=utf-8')
     except Exception as e:
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
 
@@ -842,11 +621,7 @@ def debug_alerts():
     try:
         refresh_realtime_cache_if_needed()
         processed_alerts = get_processed_alerts()
-        if not processed_alerts:
-            return jsonify({"status": "OK","message": "Няма активни предупреждения в момента.","data": {}})
+        if not processed_alerts: return jsonify({"status": "OK","message": "Няма активни предупреждения.","data": {}})
         return jsonify({"status": "OK","message": f"Намерени са {len(processed_alerts)} активни предупреждения.","data": processed_alerts})
     except Exception as e:
-
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
-
-
