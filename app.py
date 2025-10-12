@@ -538,7 +538,13 @@ def get_all_routes():
 
 @app.route('/api/all_stops')
 def get_all_stops():
-    return jsonify([dict(s_data, service_types=sorted(list(stop_service_info.get(s_id, {}).get('types', []))))) for s_id, s_data in stops_data.items()])
+    enriched_stops = []
+    for stop_id, stop_data in stops_data.items():
+        info = stop_service_info.get(stop_id, {})
+        stop_copy = stop_data.copy()
+        stop_copy['service_types'] = sorted(list(info.get('types', [])))
+        enriched_stops.append(stop_copy)
+    return jsonify(enriched_stops)
 
 @app.route('/api/all_lines_structured')
 def get_all_lines_structured():
@@ -625,3 +631,4 @@ def debug_alerts():
         return jsonify({"status": "OK","message": f"Намерени са {len(processed_alerts)} активни предупреждения.","data": processed_alerts})
     except Exception as e:
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
+
