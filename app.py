@@ -6,12 +6,7 @@ import csv
 from datetime import datetime, timedelta
 import pytz
 from flask_cors import CORS
-import time
-import sys
-import threading
-import math
-import traceback
-import re
+import time, sys, threading, math, traceback, re
 from bs4 import BeautifulSoup
 from collections import Counter
 
@@ -244,7 +239,7 @@ def ensure_routes_by_line_cache():
                 _build_routes_by_line()
                 print(f"--- [Lazy Init] routes_by_line_cache е готов за {time.time() - start_time:.2f} сек.")
 
-# ----------------- СТАРТИРАНЕ НА СЪРВЪРА (Бърза версия) -----------------
+# ----------------- СТАРТИРАНЕ НА СЪРВЪРА -----------------
 print("--- Сървърът стартира. Зареждане на основни статични данни...")
 load_static_data()
 print("--- Основните данни са заредени. Първоначално зареждане на данни в реално време...")
@@ -327,6 +322,7 @@ def get_vehicles_for_stop(stop_id):
         return jsonify(all_arrivals)
     except Exception as e:
         print(f"КРИТИЧНА ГРЕШКА в get_vehicles_for_stop: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/api/bulk_detailed_arrivals', methods=['POST'])
@@ -472,6 +468,7 @@ def get_shape_for_trip(trip_id):
 
 @app.route('/api/stops_for_trip/<trip_id>')
 def get_stops_for_trip(trip_id):
+    ensure_route_details_cache()
     if trip_id not in trip_stops_sequence: return jsonify({"error": "Trip not found"}), 404
     stops_list = [dict(stops_data.get(s['stop_id']), **{'stop_sequence': s['stop_sequence']}) for s in trip_stops_sequence.get(trip_id, []) if stops_data.get(s['stop_id'])]
     return jsonify(stops_list)
@@ -502,7 +499,6 @@ def get_all_lines_structured():
                 elif r_type == '0': transport_type = 'TRAM'
                 elif r_type == '11': transport_type = 'TROLLEY'
                 elif r_type in ['1','2']: transport_type = 'METRO'
-                
                 directions = [{"headsign": v['direction'], "example_trip_id": v['trip_id_sample']} for v in variations]
                 final_list.append({"line_name": line_num, "transport_type": transport_type, "directions": directions})
         return jsonify(final_list)
