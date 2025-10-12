@@ -702,7 +702,8 @@ def get_shape_for_trip(trip_id):
     trip_info = trips_data.get(trip_id)
     if not trip_info: return jsonify({"error": "Trip not found"}), 404
     shape_id = trip_info.get('shape_id')
-    shape_points = shapes_data.get(shape_id, [])
+    # ИЗПОЛЗВА get_shape_by_id
+    shape_points = get_shape_by_id(shape_id)
     return jsonify(shape_points)
 
 @app.route('/api/stops_for_trip/<trip_id>')
@@ -847,4 +848,5 @@ def debug_alerts():
     except Exception as e:
 
         return jsonify({"error": f"Възникна грешка: {e}"}), 500
+
 
